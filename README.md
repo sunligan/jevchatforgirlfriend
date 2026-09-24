@@ -1,5 +1,16 @@
 # Jev 聊天助手 (Jev Chat Assistant)
 
+## 本 fork：v1.3.2 测试版
+
+判断、候选生成、排序现在都可使用 **OpenAI Chat Completions** 或 **Anthropic Messages**，Jev 为可选后端。输入法/滚动只做稳定刷新，不重复请求模型；悬浮窗可暂停/恢复。设置中打开「判断和排序复用下方回复接口」，即可只配置一套服务。已有 Jev 配置升级后保持不变。
+
+- 测试版包名 `com.jev.probe.sunligan`，版本 `1.3.3-sun-test`，Android 11+ / ARM64。
+- 通用模型展示文字自评、依据、缺失事实，不伪造概率；排序只显示先后顺序。
+- 本地构建：`tools/build-android-test.sh`；输出 `dist/jev-assistant-1.3.2-sun-test.apk`。
+- [配置说明与已知限制](docs/v1.3.2-protocols.md)。此 fork 测试包尚未上传至上游下载链接，下文保留上游 v1.3 的介绍。
+
+---
+
 **装在手机上的「对话副驾」：你在任何聊天 App 里聊天，它在旁边读懂对方、告诉你该怎么回，一键填进输入框，发不发由你。**
 
 已在 **微信、QQ、X（Twitter 私信）** 三个平台真机跑通，飞书采集已接入。一套内核，一个 App 一个几十行的适配器。
@@ -46,7 +57,7 @@
 adb install -r apk/jev-assistant-v1.3-release.apk
 ```
 
-**2. 填密钥。** 打开 App → 设置 →「接口」现在分三张卡：判断接口 / 回复接口 / 视觉接口。最简单只填「判断接口」一栏的 [OpenRouter](https://openrouter.ai/) API Key，其余两栏留空会自动继承这把密钥就能用。想换回复模型（默认 `deepseek/deepseek-chat-v3.1`，国内 Gemini / OpenAI 会被区域限制）就在「回复接口」选预设（OpenRouter / DeepSeek 官方 / 通义兼容）或自填地址，每张卡都有独立的一键连通测试。
+**2. 填密钥。** 打开 App → 设置 →「接口」现在分三张卡：判断接口 / 回复接口 / 视觉接口。本 fork 最简单的用法是在「回复接口」选 OpenAI 兼容或 Anthropic，填写地址、密钥和模型，然后打开「判断和排序复用下方回复接口」。旧 Jev 配置仍可使用；空密钥仅在同一服务源站间回退，不跨服务商继承。想换回复模型（默认 `deepseek/deepseek-chat-v3.1`，国内 Gemini / OpenAI 会被区域限制）就在「回复接口」选预设（OpenRouter / DeepSeek 官方 / 通义兼容）或自填地址，每张卡都有独立的一键连通测试。
 
 **3. 开权限。** 按主页向导开三项：
 - 无障碍（读消息；升级到 1.3 后需要把无障碍关掉再打开一次，截屏能力才生效）

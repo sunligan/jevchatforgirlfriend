@@ -9,13 +9,19 @@ import com.jev.probe.core.RankedReply
 import com.jev.probe.core.Score
 import com.jev.probe.core.kb.ChatContext
 import org.json.JSONObject
+import org.json.JSONArray
 
 /**
  * The Jev judgment route only: the 7 judgment questions in one call, and the
  * ranking question over already-drafted candidates. Reads judgeProvider /
  * judgeBaseUrl / judgeKey / judgeModel from [Prefs]; nothing generative here.
  */
-class JudgeClient(private val prefs: Prefs) {
+class JudgeClient(prefs: Prefs) {
+    private val jev = prefs.isJevJudge()
+    private val genericConfig = if (jev) null else prefs.judgeChatConfig()
+    private val endpoint = if (jev) prefs.judgeEndpoint() else ""
+    private val apiKey = prefs.effectiveJudgeKey()
+    private val model = prefs.effectiveJudgeModel()
 
     /**
      * The 7 judgment questions (fast, ~1s). Errors are returned, not thrown.
@@ -26,6 +32,11 @@ class JudgeClient(private val prefs: Prefs) {
     fun judge(snapshot: ChatSnapshot, relationship: String, ctx: ChatContext? = null): Analysis {
         val start = System.currentTimeMillis()
         return try {
+            if (!jev) {
+                val state = genericState(snapshot, relationship, ctx)
+                val text = ChatApi(requireNotNull(genericConfig), Route.JUDGE).complete(GenericJudgeCodec.system, state.toString())
+                return GenericJudgeCodec.parse(text, System.currentTimeMillis() - start)
+            }
             val answers = postDecisions(
                 snapshot, relationship, ctx,
                 JevQuestions.judge()
@@ -55,6 +66,12 @@ class JudgeClient(private val prefs: Prefs) {
         candidates: List<String>,
         ctx: ChatContext? = null
     ): List<RankedReply> {
+        if (!jev) {
+            val state = genericState(snapshot, relationship, ctx)
+            state.put("candidates", JSONArray(candidates))
+            val text = ChatApi(requireNotNull(genericConfig), Route.JUDGE).complete(GenericJudgeCodec.rankSystem, state.toString(), 1024)
+            return GenericJudgeCodec.ranked(text, candidates)
+        }
         val questions = JSONObject().put("best_reply",
             JevQuestions.rankQuestion(candidates).getJSONObject("best_reply"))
         val answers = postDecisions(snapshot, relationship, ctx, questions)
@@ -70,6 +87,9 @@ class JudgeClient(private val prefs: Prefs) {
      * request carrying them comes back 4xx, it is sent again once without them,
      * so an unverified field can degrade the analysis but never break it.
      */
+    private fun genericState(snapshot: ChatSnapshot, relationship: String, ctx: ChatContext?): JSONObject =
+        JevQuestions.buildState(snapshot, relationship, ctx?.background(relationship) ?: "", ctx?.history ?: emptyList())
+
     private fun postDecisions(
         snapshot: ChatSnapshot,
         relationship: String,
@@ -90,13 +110,13 @@ class JudgeClient(private val prefs: Prefs) {
     }
 
     private fun send(state: JSONObject, questions: JSONObject): JSONObject {
-        val url = prefs.judgeEndpoint()
+        val url = endpoint
         val body = JSONObject()
-            .put("model", prefs.judgeModel)
+            .put("model", model)
             .put("state", state)
             .put("questions", questions)
-        val resp = HttpJson.post(url, prefs.judgeKey, body, Route.JUDGE, HttpJson.headersFor(url))
-        return resp.optJSONObject("answers") ?: JSONObject()
+        val resp = HttpJson.post(url, apiKey, body, Route.JUDGE, HttpJson.headersFor(url))
+        return resp.optJSONObject("answers") ?: throw IllegalArgumentException("Jev 响应缺少 answers；请确认协议选择，普通聊天 API 请选 OpenAI 或 Anthropic")
     }
 
     private fun parseChoice(o: JSONObject?): Choice? {

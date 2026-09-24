@@ -44,7 +44,8 @@ class SettingsActivity : AppCompatActivity() {
     private val pillOff = Color.parseColor("#EEF1F5")
 
     /** Selected provider index per card, held so Save can read it back. */
-    private var judgeProviderIdx = 0
+    private var judgeProtocolIdx = 0
+    private var replyProtocolIdx = 0
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).roundToInt()
@@ -69,133 +70,146 @@ class SettingsActivity : AppCompatActivity() {
         // =================== 接口 ===================
         root.addView(section("接口"))
 
-        // --- 判断接口（Jev） ---
-        val judgeCard = card()
-        judgeCard.addView(cardTitle("判断接口（Jev）"))
-        judgeCard.addView(text("读对方消息、给意图判断和候选排序。必须配置。", 12f, sub))
-
-        val judgeBaseEdit = edit(prefs.judgeBaseUrl, Prefs.DEFAULT_JUDGE_BASE_OPENROUTER)
-        val judgeModelEdit = edit(prefs.judgeModel, Prefs.DEFAULT_JUDGE_MODEL_OPENROUTER)
-        judgeProviderIdx = when (prefs.judgeProvider) {
-            Prefs.PROVIDER_TYPESAFE -> 1
-            Prefs.PROVIDER_CUSTOM -> 2
+        // Capture all typed connection fields before wiring test buttons. Tests never use stale saved values.
+        val judgeBaseEdit = edit(prefs.judgeBaseUrl, "HTTPS 地址或完整接口路径")
+        val judgeModelEdit = edit(prefs.judgeModel, "填写服务商提供的模型 ID")
+        judgeKeyEdit = edit(prefs.judgeKey, "判断接口密钥", password = true)
+        val replyBaseEdit = edit(prefs.replyBaseUrl, "HTTPS 地址或完整接口路径")
+        val replyModelEdit = edit(prefs.replyModel, "填写服务商提供的模型 ID")
+        replyKeyEdit = edit(prefs.replyKey, "留空仅可复用同一服务地址的判断密钥", password = true)
+        judgeProtocolIdx = when (prefs.judgeProtocol) {
+            Prefs.PROTOCOL_OPENAI -> 1
+            Prefs.PROTOCOL_ANTHROPIC -> 2
             else -> 0
         }
-        judgeCard.addView(pills(
-            listOf("OpenRouter", "TypeSafe 直连", "自定义"), judgeProviderIdx) { idx ->
-            judgeProviderIdx = idx
+        var legacyProvider = prefs.judgeProvider
+        replyProtocolIdx = if (prefs.replyProtocol == Prefs.PROTOCOL_ANTHROPIC) 1 else 0
+        val judgeFields = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val judgeUseReplyRow = toggleRow("判断和排序复用下方回复接口", prefs.judgeUseReply) { enabled ->
+            judgeFields.visibility = if (enabled) View.GONE else View.VISIBLE
+        }
+        judgeFields.visibility = if (prefs.judgeUseReply) View.GONE else View.VISIBLE
+
+        fun typedConnections(name: String): Prefs = draftPrefs(name) {
+            judgeProtocol = protocolOf(judgeProtocolIdx)
+            judgeUseReply = (judgeUseReplyRow.tag as? Boolean) ?: false
+            judgeProvider = legacyProvider
+            judgeBaseUrl = judgeBaseEdit.text.toString().trim()
+            judgeKey = judgeKeyEdit.text.toString().trim()
+            judgeModel = judgeModelEdit.text.toString().trim()
+            replyProtocol = if (replyProtocolIdx == 1) Prefs.PROTOCOL_ANTHROPIC else Prefs.PROTOCOL_OPENAI
+            replyBaseUrl = replyBaseEdit.text.toString().trim()
+            replyKey = replyKeyEdit.text.toString().trim()
+            replyModel = replyModelEdit.text.toString().trim()
+        }
+        fun validateJudge(probe: Prefs) {
+            require(probe.hasKey()) { "请填写实际使用的判断/回复接口密钥；不同服务地址不会互借密钥" }
+            require(probe.effectiveJudgeModel().isNotBlank()) { "请填写实际使用的模型 ID" }
+            require(probe.effectiveJudgeBase().isNotBlank()) { "请填写接口地址" }
+            if (!probe.isJevJudge()) probe.judgeEndpoint()
+        }
+
+        val judgeCard = card()
+        judgeCard.addView(cardTitle("判断与排序接口"))
+        judgeCard.addView(text("可复用回复接口，只配一套；也可关闭复用，分别配置。Jev 是可选项。", 12f, sub))
+        judgeCard.addView(judgeUseReplyRow)
+        val legacyPresets = pills(listOf("Jev / OpenRouter", "Jev / TypeSafe", "Jev / 完整自定义地址"),
+            when (legacyProvider) { Prefs.PROVIDER_TYPESAFE -> 1; Prefs.PROVIDER_CUSTOM -> 2; else -> 0 }) { idx ->
+            legacyProvider = when (idx) { 1 -> Prefs.PROVIDER_TYPESAFE; 2 -> Prefs.PROVIDER_CUSTOM; else -> Prefs.PROVIDER_OPENROUTER }
+            when (idx) {
+                0 -> { judgeBaseEdit.setText(Prefs.DEFAULT_JUDGE_BASE_OPENROUTER); judgeModelEdit.setText(Prefs.DEFAULT_JUDGE_MODEL_OPENROUTER) }
+                1 -> { judgeBaseEdit.setText(Prefs.DEFAULT_JUDGE_BASE_TYPESAFE); judgeModelEdit.setText(Prefs.DEFAULT_JUDGE_MODEL_TYPESAFE) }
+                2 -> {
+                    val base = judgeBaseEdit.text.toString().trim().trimEnd('/')
+                    judgeBaseEdit.setText(when (base) {
+                        Prefs.DEFAULT_JUDGE_BASE_OPENROUTER -> "${base}/alpha/decisions"
+                        Prefs.DEFAULT_JUDGE_BASE_TYPESAFE -> "${base}/v1/systemone"
+                        else -> base
+                    })
+                }
+            }
+        }
+        legacyPresets.visibility = if (judgeProtocolIdx == 0) View.VISIBLE else View.GONE
+        judgeFields.addView(pills(listOf("Jev", "OpenAI 兼容", "Anthropic"), judgeProtocolIdx) { idx ->
+            judgeProtocolIdx = idx
+            legacyPresets.visibility = if (idx == 0) View.VISIBLE else View.GONE
             when (idx) {
                 0 -> {
-                    judgeBaseEdit.setText(Prefs.DEFAULT_JUDGE_BASE_OPENROUTER)
-                    judgeModelEdit.setText(Prefs.DEFAULT_JUDGE_MODEL_OPENROUTER)
+                    if (legacyProvider != Prefs.PROVIDER_CUSTOM) {
+                        judgeBaseEdit.setText(if (legacyProvider == Prefs.PROVIDER_TYPESAFE) Prefs.DEFAULT_JUDGE_BASE_TYPESAFE else Prefs.DEFAULT_JUDGE_BASE_OPENROUTER)
+                        judgeModelEdit.setText(if (legacyProvider == Prefs.PROVIDER_TYPESAFE) Prefs.DEFAULT_JUDGE_MODEL_TYPESAFE else Prefs.DEFAULT_JUDGE_MODEL_OPENROUTER)
+                    }
                 }
-                1 -> {
-                    judgeBaseEdit.setText(Prefs.DEFAULT_JUDGE_BASE_TYPESAFE)
-                    judgeModelEdit.setText(Prefs.DEFAULT_JUDGE_MODEL_TYPESAFE)
-                }
-                // Custom POSTs the box verbatim, so a preset HOST left in the box
-                // would hit the API root. Expand it into the full endpoint the
-                // preset would have used; anything hand-typed is left alone.
-                2 -> judgeBaseEdit.setText(expandJudgeUrl(judgeBaseEdit.text.toString()))
+                1 -> { judgeBaseEdit.setText(Prefs.DEFAULT_JUDGE_BASE_OPENAI); judgeModelEdit.setText("") }
+                2 -> { judgeBaseEdit.setText(Prefs.DEFAULT_JUDGE_BASE_ANTHROPIC); judgeModelEdit.setText("") }
             }
         })
-        judgeCard.addView(label("Base URL"))
-        judgeCard.addView(judgeBaseEdit)
-        judgeCard.addView(text("OpenRouter 拼 /alpha/decisions；TypeSafe 拼 /v1/systemone；自定义按原样 POST。",
-            11f, sub))
-        judgeCard.addView(label("密钥"))
-        judgeCard.addView(edit(prefs.judgeKey, "sk-...", password = true).also { judgeKeyEdit = it })
-        judgeCard.addView(label("模型"))
-        judgeCard.addView(judgeModelEdit)
+        judgeFields.addView(legacyPresets)
+        judgeFields.addView(label("Base URL")); judgeFields.addView(judgeBaseEdit)
+        judgeFields.addView(text("OpenAI：域名根地址、/v1 或完整 /chat/completions；Anthropic：根地址、/v1 或完整 /v1/messages。切换后请核对地址、密钥、模型。", 11f, sub))
+        judgeFields.addView(label("密钥")); judgeFields.addView(judgeKeyEdit)
+        judgeFields.addView(label("模型 ID")); judgeFields.addView(judgeModelEdit)
+        judgeCard.addView(judgeFields)
         val judgeResult = resultText()
-        judgeCard.addView(cardBtn("测试判断") {
-            val base = judgeBaseEdit.text.toString().trim()
-            val key = judgeKeyEdit.text.toString().trim()
-            val model = judgeModelEdit.text.toString().trim()
-            if (key.isBlank()) { judgeResult.text = "请先填密钥"; return@cardBtn }
-            judgeResult.text = "测试中…"
-            // Provider follows the address when it is still a known preset host,
-            // so a stale pill selection cannot send a TypeSafe path to OpenRouter.
-            val provider = resolveJudgeProvider(judgeProviderIdx, base)
-            if (provider == Prefs.PROVIDER_CUSTOM && base.isBlank()) {
-                judgeResult.text = "自定义档要填完整 URL（带路径）"; return@cardBtn
-            }
-            // Custom means we know nothing about the endpoint — guessing a model
-            // name here would test something the user never asked for.
-            if (provider == Prefs.PROVIDER_CUSTOM && model.isBlank()) {
-                judgeResult.text = "请填写模型名"; return@cardBtn
-            }
-            val probe = draftPrefs(SCRATCH_JUDGE) {
-                judgeProvider = provider
-                judgeBaseUrl = base.ifBlank { defaultJudgeBase(provider) }
-                judgeKey = key
-                judgeModel = model.ifBlank { defaultJudgeModel(provider) }
-            }
+        judgeCard.addView(cardBtn("测试当前判断配置") {
+            val probe = typedConnections(SCRATCH_JUDGE)
+            try { validateJudge(probe) } catch (e: Exception) { judgeResult.text = e.message; return@cardBtn }
+            val client = JudgeClient(probe)
+            judgeResult.text = "测试中…（使用当前表单，无需先保存）"
             worker.execute {
-                val t0 = System.currentTimeMillis()
-                val demo = ChatSnapshot("连通测试", listOf(
-                    Msg("other", "在吗？"), Msg("me", "在")))
-                val a = JudgeClient(probe).judge(demo, prefs.relationship)
-                val ms = System.currentTimeMillis() - t0
+                val start = System.currentTimeMillis()
+                val a = client.judge(ChatSnapshot("连通测试", listOf(Msg("me", "你好"), Msg("other", "在吗？"))), prefs.relationship)
                 main.post {
-                    judgeResult.text = if (a.error != null) "失败（${ms}ms）：${a.error}"
-                    else "成功 ${ms}ms · 意图=${a.trueIntent?.choice ?: "?"}" +
-                        "（置信 ${pct(a.trueIntent?.confidence)}）"
+                    judgeResult.text = if (a.error != null) "失败：${a.error}"
+                    else "成功 ${System.currentTimeMillis() - start}ms · ${a.trueIntent?.choice ?: "?"}" +
+                        if (a.probabilistic) " · Jev 置信 ${pct(a.trueIntent?.confidence)}" else " · 模型自评 ${a.confidenceLevel}（非概率）"
                 }
             }
         })
         judgeCard.addView(judgeResult)
         root.addView(judgeCard)
 
-        // --- 回复接口 ---
         val replyCard = card()
         replyCard.addView(cardTitle("回复接口"))
-        replyCard.addView(text("生成 3 条候选回复。任何 OpenAI 兼容地址，填到 /v1 为止。", 12f, sub))
-
-        val replyBaseEdit = edit(prefs.replyBaseUrl, Prefs.DEFAULT_REPLY_BASE)
-        val replyModelEdit = edit(prefs.replyModel, Prefs.DEFAULT_REPLY_MODEL)
+        replyCard.addView(text("支持 OpenAI Chat Completions / Anthropic Messages。复用开启时，本配置同时负责判断、生成和排序，不再需要 Jev。", 12f, sub))
         val replyIdx = when (prefs.replyBaseUrl.trim().trimEnd('/')) {
-            Prefs.DEFAULT_REPLY_BASE -> 0
-            Prefs.DEEPSEEK_BASE -> 1
-            Prefs.DASHSCOPE_BASE -> 2
-            else -> 3
+            Prefs.DEFAULT_REPLY_BASE -> 0; Prefs.DEEPSEEK_BASE -> 1; Prefs.DASHSCOPE_BASE -> 2; else -> 3
         }
-        replyCard.addView(pills(
-            listOf("OpenRouter", "DeepSeek 官方", "通义兼容", "自定义"), replyIdx) { idx ->
+        val replyPresets = pills(listOf("OpenRouter", "DeepSeek 官方", "通义兼容", "自定义"), replyIdx) { idx ->
             when (idx) {
                 0 -> { replyBaseEdit.setText(Prefs.DEFAULT_REPLY_BASE); replyModelEdit.setText(Prefs.DEFAULT_REPLY_MODEL) }
                 1 -> { replyBaseEdit.setText(Prefs.DEEPSEEK_BASE); replyModelEdit.setText(Prefs.DEEPSEEK_MODEL) }
                 2 -> { replyBaseEdit.setText(Prefs.DASHSCOPE_BASE); replyModelEdit.setText(Prefs.DASHSCOPE_MODEL) }
             }
+        }
+        replyPresets.visibility = if (replyProtocolIdx == 0) View.VISIBLE else View.GONE
+        replyCard.addView(pills(listOf("OpenAI 兼容", "Anthropic"), replyProtocolIdx) { idx ->
+            replyProtocolIdx = idx
+            replyPresets.visibility = if (idx == 0) View.VISIBLE else View.GONE
+            if (idx == 1) { replyBaseEdit.setText(Prefs.DEFAULT_REPLY_BASE_ANTHROPIC); replyModelEdit.setText("") }
+            else { replyBaseEdit.setText(Prefs.DEFAULT_JUDGE_BASE_OPENAI); replyModelEdit.setText("") }
         })
-        replyCard.addView(label("Base URL"))
-        replyCard.addView(replyBaseEdit)
-        replyCard.addView(label("密钥"))
-        replyCard.addView(edit(prefs.replyKey, "留空则用判断接口密钥", password = true).also { replyKeyEdit = it })
-        replyCard.addView(label("模型"))
-        replyCard.addView(replyModelEdit)
+        replyCard.addView(replyPresets)
+        replyCard.addView(label("Base URL")); replyCard.addView(replyBaseEdit)
+        replyCard.addView(label("密钥")); replyCard.addView(replyKeyEdit)
+        replyCard.addView(label("模型 ID（以服务商账号可用列表为准）")); replyCard.addView(replyModelEdit)
         val replyResult = resultText()
-        replyCard.addView(cardBtn("测试回复") {
-            val base = replyBaseEdit.text.toString().trim()
-            val model = replyModelEdit.text.toString().trim()
-            val probe = draftPrefs(SCRATCH_REPLY) {
-                judgeKey = judgeKeyEdit.text.toString().trim()
-                replyBaseUrl = base.ifBlank { Prefs.DEFAULT_REPLY_BASE }
-                replyKey = replyKeyEdit.text.toString().trim()
-                replyModel = model.ifBlank { Prefs.DEFAULT_REPLY_MODEL }
-            }
-            if (probe.effectiveReplyKey().isBlank()) { replyResult.text = "请先填密钥（或填判断接口密钥）"; return@cardBtn }
-            replyResult.text = "测试中…"
+        replyCard.addView(cardBtn("测试当前回复配置") {
+            val probe = typedConnections(SCRATCH_REPLY)
+            try {
+                require(probe.effectiveReplyKey().isNotBlank()) { "请填写回复密钥，或配置同一服务地址的判断密钥" }
+                require(probe.replyModel.isNotBlank()) { "请填写回复模型 ID" }
+                probe.replyEndpoint()
+            } catch (e: Exception) { replyResult.text = e.message; return@cardBtn }
+            val client = ReplyClient(probe)
+            replyResult.text = "测试中…（使用当前表单，无需先保存）"
             worker.execute {
-                val t0 = System.currentTimeMillis()
-                var err: String? = null
-                val out = try {
-                    ReplyClient(probe).ping()
-                } catch (e: Exception) { err = e.message; "" }
-                val ms = System.currentTimeMillis() - t0
+                val start = System.currentTimeMillis()
+                val result = runCatching { client.ping() }
                 main.post {
-                    replyResult.text = if (err != null) "失败（${ms}ms）：$err"
-                    else "成功 ${ms}ms · 返回：${out.replace("\n", " ").take(60)}"
+                    replyResult.text = result.fold(
+                        { "成功 ${System.currentTimeMillis() - start}ms · ${it.replace("\n", " ").take(60)}" },
+                        { "失败：${it.message}" })
                 }
             }
         })
@@ -236,6 +250,7 @@ class SettingsActivity : AppCompatActivity() {
             }
             val probe = draftPrefs(SCRATCH_VISION) {
                 judgeKey = judgeKeyEdit.text.toString().trim()
+                judgeBaseUrl = judgeBaseEdit.text.toString().trim()
                 replyBaseUrl = replyBaseEdit.text.toString().trim().ifBlank { Prefs.DEFAULT_REPLY_BASE }
                 replyKey = replyKeyEdit.text.toString().trim()
                 visionBaseUrl = visionBase
@@ -323,6 +338,40 @@ class SettingsActivity : AppCompatActivity() {
         card2.addView(kbResult)
         root.addView(card2)
 
+        // =================== 客服 Beta 0.1 ===================
+        root.addView(section("客服 Beta 0.1"))
+        val csCard = card()
+        csCard.addView(cardTitle("抖音固定话术客服"))
+        csCard.addView(text("只处理抖音当前会话；不调用模型生成固定话术。手动模式只填入，自动模式才允许点击发送。", 12f, sub))
+        val csModeRow = toggleRow("启用客服 Beta 模式", prefs.customerMode)
+        val csAutoRow = toggleRow("固定话术自动发送（高风险）", prefs.customerAutoSend)
+        csCard.addView(csModeRow)
+        csCard.addView(csAutoRow)
+        csCard.addView(text("关闭自动发送时：自动识别、填入，但最后由你点击发送。开启后：只对预设固定话术尝试发送，识别不确定时不会发送。", 11f, sub))
+        csCard.addView(label("固定回复第 1 句"))
+        val csFirstEdit = edit(prefs.customerReplyFirst, "例如：您好，请问您需要咨询什么？").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 2; gravity = android.view.Gravity.TOP
+        }
+        csCard.addView(csFirstEdit)
+        csCard.addView(label("固定回复第 2 句"))
+        val csSecondEdit = edit(prefs.customerReplySecond, "例如：如果方便，请留下您的联系方式。").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 2; gravity = android.view.Gravity.TOP
+        }
+        csCard.addView(csSecondEdit)
+        csCard.addView(label("线索分类（可自定义）"))
+        val csCategoryEdit = edit(prefs.customerCategory, "例如：高意向 / 售后 / 代理商")
+        csCard.addView(csCategoryEdit)
+        csCard.addView(label("默认微信分发群"))
+        val csGroupEdit = edit(prefs.customerWechatGroup, "例如：高意向客户群")
+        csCard.addView(csGroupEdit)
+        csCard.addView(text("Beta 0.1 会保存抖音线索和待分发群名；微信分发先以队列/填入为主，避免发错群。", 11f, sub))
+        csCard.addView(cardBtn("客服线索 / 微信分发队列") {
+            startActivity(android.content.Intent(this, CustomerQueueActivity::class.java))
+        })
+        root.addView(csCard)
+
         // =================== 外观 ===================
         root.addView(section("外观"))
         val card3 = card()
@@ -344,30 +393,23 @@ class SettingsActivity : AppCompatActivity() {
 
         // =================== 保存 ===================
         root.addView(primaryBtn("保存全部设置") {
-            // Address wins over the pill: a preset HOST in the box means that
-            // preset's provider (and so its path), whatever the pill last said.
-            val judgeBaseTyped = judgeBaseEdit.text.toString().trim()
-            val judgeProv = resolveJudgeProvider(judgeProviderIdx, judgeBaseTyped)
-            val judgeModelTyped = judgeModelEdit.text.toString().trim()
-            prefs.judgeProvider = judgeProv
-            // Blank falls back to THIS provider's preset — never OpenRouter's by
-            // default. Custom is left exactly as typed (blank included): guessing
-            // a URL for it would silently point somewhere the user did not choose.
-            prefs.judgeBaseUrl = when {
-                judgeBaseTyped.isNotBlank() -> judgeBaseTyped
-                judgeProv == Prefs.PROVIDER_CUSTOM -> ""
-                else -> defaultJudgeBase(judgeProv)
-            }
-            prefs.judgeKey = judgeKeyEdit.text.toString()
-            prefs.judgeModel = when {
-                judgeModelTyped.isNotBlank() -> judgeModelTyped
-                judgeProv == Prefs.PROVIDER_CUSTOM -> ""
-                else -> defaultJudgeModel(judgeProv)
-            }
+            prefs.judgeProtocol = protocolOf(judgeProtocolIdx)
+            prefs.judgeUseReply = (judgeUseReplyRow.tag as? Boolean) ?: false
+            prefs.judgeProvider = legacyProvider
+            prefs.judgeBaseUrl = judgeBaseEdit.text.toString().trim()
+            prefs.judgeKey = judgeKeyEdit.text.toString().trim()
+            prefs.judgeModel = judgeModelEdit.text.toString().trim()
+            prefs.replyProtocol = if (replyProtocolIdx == 1) Prefs.PROTOCOL_ANTHROPIC else Prefs.PROTOCOL_OPENAI
+            prefs.replyBaseUrl = replyBaseEdit.text.toString().trim()
+            prefs.replyKey = replyKeyEdit.text.toString().trim()
+            prefs.replyModel = replyModelEdit.text.toString().trim()
 
-            prefs.replyBaseUrl = replyBaseEdit.text.toString().trim().ifBlank { Prefs.DEFAULT_REPLY_BASE }
-            prefs.replyKey = replyKeyEdit.text.toString()
-            prefs.replyModel = replyModelEdit.text.toString().trim().ifBlank { Prefs.DEFAULT_REPLY_MODEL }
+            prefs.customerMode = (csModeRow.tag as? Boolean) ?: false
+            prefs.customerAutoSend = (csAutoRow.tag as? Boolean) ?: false
+            prefs.customerReplyFirst = csFirstEdit.text.toString().trim()
+            prefs.customerReplySecond = csSecondEdit.text.toString().trim()
+            prefs.customerCategory = csCategoryEdit.text.toString().trim().ifBlank { "未分类" }
+            prefs.customerWechatGroup = csGroupEdit.text.toString().trim()
 
             prefs.visionBaseUrl = visionBaseEdit.text.toString().trim()
             prefs.visionKey = visionKeyEdit.text.toString()
@@ -394,39 +436,11 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var replyKeyEdit: EditText
     private lateinit var visionKeyEdit: EditText
 
-    private fun providerOf(idx: Int) = when (idx) {
-        1 -> Prefs.PROVIDER_TYPESAFE
-        2 -> Prefs.PROVIDER_CUSTOM
-        else -> Prefs.PROVIDER_OPENROUTER
+    private fun protocolOf(idx: Int) = when (idx) {
+        1 -> Prefs.PROTOCOL_OPENAI
+        2 -> Prefs.PROTOCOL_ANTHROPIC
+        else -> Prefs.PROTOCOL_JEV
     }
-
-    /**
-     * The provider actually implied by what is in the address box. A preset host
-     * carries its own path (`/alpha/decisions`, `/v1/systemone`), so leaving that
-     * host in the box while the pill says something else would POST the wrong
-     * path — or, for custom, the bare API root.
-     */
-    private fun resolveJudgeProvider(idx: Int, base: String): String =
-        when (base.trim().trimEnd('/')) {
-            Prefs.DEFAULT_JUDGE_BASE_OPENROUTER -> Prefs.PROVIDER_OPENROUTER
-            Prefs.DEFAULT_JUDGE_BASE_TYPESAFE -> Prefs.PROVIDER_TYPESAFE
-            else -> providerOf(idx)
-        }
-
-    /** The full endpoint a preset host would have been expanded to. */
-    private fun expandJudgeUrl(base: String): String = when (base.trim().trimEnd('/')) {
-        Prefs.DEFAULT_JUDGE_BASE_OPENROUTER -> Prefs.DEFAULT_JUDGE_BASE_OPENROUTER + "/alpha/decisions"
-        Prefs.DEFAULT_JUDGE_BASE_TYPESAFE -> Prefs.DEFAULT_JUDGE_BASE_TYPESAFE + "/v1/systemone"
-        else -> base.trim()
-    }
-
-    private fun defaultJudgeBase(provider: String): String =
-        if (provider == Prefs.PROVIDER_TYPESAFE) Prefs.DEFAULT_JUDGE_BASE_TYPESAFE
-        else Prefs.DEFAULT_JUDGE_BASE_OPENROUTER
-
-    private fun defaultJudgeModel(provider: String): String =
-        if (provider == Prefs.PROVIDER_TYPESAFE) Prefs.DEFAULT_JUDGE_MODEL_TYPESAFE
-        else Prefs.DEFAULT_JUDGE_MODEL_OPENROUTER
 
     /**
      * A throwaway [Prefs] view carrying exactly what is in the boxes right now,
@@ -488,7 +502,7 @@ class SettingsActivity : AppCompatActivity() {
         v.background = round(dp(9), if (on) accent else pillOff)
     }
 
-    private fun toggleRow(labelText: String, initial: Boolean): LinearLayout {
+    private fun toggleRow(labelText: String, initial: Boolean, onChange: ((Boolean) -> Unit)? = null): LinearLayout {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(12), 0, dp(2)); tag = initial
@@ -508,6 +522,7 @@ class SettingsActivity : AppCompatActivity() {
             sw.text = if (now) "开" else "关"
             sw.setTextColor(if (now) Color.WHITE else sub)
             sw.background = round(dp(10), if (now) accent else Color.parseColor("#E5E7EB"))
+            onChange?.invoke(now)
         }
         row.addView(lab); row.addView(sw)
         return row

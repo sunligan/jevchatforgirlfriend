@@ -1,7 +1,11 @@
 package com.jev.probe.core
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.util.Log
+import com.jev.probe.jev.ApiEndpoints
+import com.jev.probe.jev.ChatApiConfig
+import com.jev.probe.jev.ChatProtocol
 
 /**
  * App-private config store. Holds the three API routes (judge / reply / vision),
@@ -11,9 +15,10 @@ import android.util.Log
  * Key handling: stored in app-private SharedPreferences (not world-readable,
  * never logged, never in code/git). Only key *lengths* are ever logged.
  */
-class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
-
-    private val sp = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+class Prefs private constructor(private val sp: SharedPreferences, prefsName: String) {
+    constructor(context: Context, prefsName: String = PREFS_MAIN) :
+        this(context.getSharedPreferences(prefsName, Context.MODE_PRIVATE), prefsName)
+    internal constructor(storage: SharedPreferences) : this(storage, "unit-test")
 
     /**
      * Only the real config migrates — and only the real config logs it. The
@@ -42,14 +47,18 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
 
     // ---------------------------------------------------------------- judge
 
-    /** "openrouter" | "typesafe" | "custom". */
+    /** Legacy Jev provider: "openrouter" | "typesafe" | "custom". */
     var judgeProvider: String
         get() = sp.getString(K_JUDGE_PROVIDER, PROVIDER_OPENROUTER) ?: PROVIDER_OPENROUTER
         set(v) = sp.edit().putString(K_JUDGE_PROVIDER, v.trim()).apply()
 
     /** Host root; the path is appended per provider (see [judgeEndpoint]). */
     var judgeBaseUrl: String
-        get() = sp.getString(K_JUDGE_BASE, DEFAULT_JUDGE_BASE_OPENROUTER) ?: DEFAULT_JUDGE_BASE_OPENROUTER
+        get() = sp.getString(K_JUDGE_BASE, when (judgeProtocol) {
+            PROTOCOL_OPENAI -> DEFAULT_JUDGE_BASE_OPENAI
+            PROTOCOL_ANTHROPIC -> DEFAULT_JUDGE_BASE_ANTHROPIC
+            else -> DEFAULT_JUDGE_BASE_OPENROUTER
+        }) ?: ""
         set(v) = sp.edit().putString(K_JUDGE_BASE, v.trim()).apply()
 
     var judgeKey: String
@@ -57,8 +66,26 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         set(v) = sp.edit().putString(K_JUDGE_KEY, v.trim()).apply()
 
     var judgeModel: String
-        get() = sp.getString(K_JUDGE_MODEL, DEFAULT_JUDGE_MODEL_OPENROUTER) ?: DEFAULT_JUDGE_MODEL_OPENROUTER
+        get() = sp.getString(K_JUDGE_MODEL, if (judgeProtocol == PROTOCOL_JEV) DEFAULT_JUDGE_MODEL_OPENROUTER else "") ?: ""
         set(v) = sp.edit().putString(K_JUDGE_MODEL, v.trim()).apply()
+
+    /** "jev" | "openai" | "anthropic". Existing installs default to Jev. */
+    var judgeProtocol: String
+        get() = sp.getString(K_JUDGE_PROTOCOL, if (hasLegacyJudgeConfig()) PROTOCOL_JEV else PROTOCOL_OPENAI) ?: PROTOCOL_OPENAI
+        set(v) = sp.edit().putString(K_JUDGE_PROTOCOL, v.trim()).apply()
+
+    /** "openai" | "anthropic" for the reply generation route. */
+    var replyProtocol: String
+        get() = sp.getString(K_REPLY_PROTOCOL, PROTOCOL_OPENAI) ?: PROTOCOL_OPENAI
+        set(v) = sp.edit().putString(K_REPLY_PROTOCOL, v.trim()).apply()
+
+    /** Explicit opt-in reuse; upgrades with existing judgment settings keep their route. */
+    var judgeUseReply: Boolean
+        get() = sp.getBoolean(K_JUDGE_USE_REPLY, !hasLegacyJudgeConfig())
+        set(v) = sp.edit().putBoolean(K_JUDGE_USE_REPLY, v).apply()
+
+    private fun hasLegacyJudgeConfig(): Boolean = sp.contains(K_JUDGE_BASE) ||
+        sp.contains(K_JUDGE_MODEL) || sp.contains(K_JUDGE_PROVIDER) || judgeKey.isNotBlank()
 
     /** Back-compat alias so older call sites keep compiling. */
     var openRouterKey: String
@@ -157,6 +184,15 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         get() = sp.getBoolean(K_ENABLED, true)
         set(v) = sp.edit().putBoolean(K_ENABLED, v).apply()
 
+    /** Returns an unsubscribe callback; listener is retained strongly until service teardown. */
+    fun observeEnabled(onChange: () -> Unit): () -> Unit {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == K_ENABLED) onChange()
+        }
+        sp.registerOnSharedPreferenceChangeListener(listener)
+        return { sp.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
     /**
      * Conversation whitelist: titles the assistant is allowed to act on. Empty
      * set means "all conversations". Stored as a plain string set.
@@ -180,6 +216,34 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         get() = sp.getInt(K_BUBBLE_X, -1)
         set(v) = sp.edit().putInt(K_BUBBLE_X, v).apply()
 
+    // ------------------------------------------------------ customer service beta
+
+    /** Customer beta runs deterministic fixed replies on the Douyin adapter. */
+    var customerMode: Boolean
+        get() = sp.getBoolean(K_CS_MODE, false)
+        set(v) = sp.edit().putBoolean(K_CS_MODE, v).apply()
+
+    /** When true, the beta may click a visible send button for fixed text only. */
+    var customerAutoSend: Boolean
+        get() = sp.getBoolean(K_CS_AUTO_SEND, false)
+        set(v) = sp.edit().putBoolean(K_CS_AUTO_SEND, v).apply()
+
+    var customerReplyFirst: String
+        get() = sp.getString(K_CS_REPLY_FIRST, "您好，请问您需要咨询什么？") ?: ""
+        set(v) = sp.edit().putString(K_CS_REPLY_FIRST, v).apply()
+
+    var customerReplySecond: String
+        get() = sp.getString(K_CS_REPLY_SECOND, "如果方便，请留下您的联系方式。") ?: ""
+        set(v) = sp.edit().putString(K_CS_REPLY_SECOND, v).apply()
+
+    var customerCategory: String
+        get() = sp.getString(K_CS_CATEGORY, "未分类") ?: "未分类"
+        set(v) = sp.edit().putString(K_CS_CATEGORY, v).apply()
+
+    var customerWechatGroup: String
+        get() = sp.getString(K_CS_GROUP, "") ?: ""
+        set(v) = sp.edit().putString(K_CS_GROUP, v).apply()
+
     /** Auto-analyze on every incoming message; if false, user taps to analyze. */
     var autoAnalyze: Boolean
         get() = sp.getBoolean(K_AUTO, true)
@@ -188,23 +252,48 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
     // ------------------------------------------------------------- helpers
 
     /** Reply route key, falling back to the judge key. */
-    fun effectiveReplyKey(): String = replyKey.ifBlank { judgeKey }
+    fun effectiveReplyKey(): String = replyKey.ifBlank {
+        if (ApiEndpoints.sameOrigin(replyBaseUrl, judgeBaseUrl)) judgeKey else ""
+    }
 
     /** Vision route key, falling back to reply then judge. */
-    fun effectiveVisionKey(): String = visionKey.ifBlank { effectiveReplyKey() }
-
-    /** Full POST URL for the Jev decisions call, per provider. */
-    fun judgeEndpoint(): String {
-        val base = judgeBaseUrl.trim().trimEnd('/')
-        return when (judgeProvider) {
-            PROVIDER_TYPESAFE -> "$base/v1/systemone"
-            PROVIDER_CUSTOM -> judgeBaseUrl.trim()   // user supplies the full URL
-            else -> "$base/alpha/decisions"
+    fun effectiveVisionKey(): String = visionKey.ifBlank {
+        when {
+            ApiEndpoints.sameOrigin(visionBaseUrl, replyBaseUrl) -> effectiveReplyKey()
+            ApiEndpoints.sameOrigin(visionBaseUrl, judgeBaseUrl) -> judgeKey
+            else -> ""
         }
     }
 
-    /** Full POST URL for the OpenAI-compatible chat completions call. */
-    fun replyEndpoint(): String = "${replyBaseUrl.trim().trimEnd('/')}/chat/completions"
+    fun effectiveJudgeProtocol(): String = if (judgeUseReply) replyProtocol else judgeProtocol
+    fun effectiveJudgeKey(): String = if (judgeUseReply) effectiveReplyKey() else judgeKey
+    fun effectiveJudgeModel(): String = if (judgeUseReply) replyModel else judgeModel
+    fun effectiveJudgeBase(): String = if (judgeUseReply) replyBaseUrl else judgeBaseUrl
+    fun isJevJudge(): Boolean = effectiveJudgeProtocol() == PROTOCOL_JEV
+    private fun chatProtocol(value: String): ChatProtocol = when (value) {
+        PROTOCOL_OPENAI -> ChatProtocol.OPENAI
+        PROTOCOL_ANTHROPIC -> ChatProtocol.ANTHROPIC
+        else -> throw IllegalArgumentException("未知聊天协议：${value}")
+    }
+    fun judgeChatConfig() = ChatApiConfig(chatProtocol(effectiveJudgeProtocol()), effectiveJudgeBase(), effectiveJudgeKey(), effectiveJudgeModel())
+    fun replyChatConfig() = ChatApiConfig(chatProtocol(replyProtocol), replyBaseUrl, effectiveReplyKey(), replyModel)
+
+    /** Full POST URL for the selected judgment protocol. */
+    fun judgeEndpoint(): String {
+        val raw = effectiveJudgeBase().trim().trimEnd('/')
+        return when (effectiveJudgeProtocol()) {
+            PROTOCOL_OPENAI -> ApiEndpoints.chat(raw, ChatProtocol.OPENAI)
+            PROTOCOL_ANTHROPIC -> ApiEndpoints.chat(raw, ChatProtocol.ANTHROPIC)
+            else -> when (judgeProvider) {
+                PROVIDER_TYPESAFE -> "$raw/v1/systemone"
+                PROVIDER_CUSTOM -> judgeBaseUrl.trim()   // legacy Jev custom endpoint
+                else -> "$raw/alpha/decisions"
+            }
+        }
+    }
+
+    /** Full POST URL for the selected reply protocol. */
+    fun replyEndpoint(): String = ApiEndpoints.chat(replyBaseUrl, chatProtocol(replyProtocol))
 
     /** Same shape as [replyEndpoint]; blank falls back to the OpenRouter default. */
     fun visionEndpoint(): String {
@@ -220,7 +309,7 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
     }
 
     /** Readiness gate: the judge route is the one that must be configured. */
-    fun hasKey(): Boolean = judgeKey.isNotBlank()
+    fun hasKey(): Boolean = effectiveJudgeKey().isNotBlank()
 
     companion object {
         private const val TAG = "JEVASSIST"
@@ -234,7 +323,10 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         private const val K_JUDGE_BASE = "judge_base_url"
         private const val K_JUDGE_KEY = "judge_key"
         private const val K_JUDGE_MODEL = "judge_model"
+        private const val K_JUDGE_PROTOCOL = "judge_protocol"
+        private const val K_JUDGE_USE_REPLY = "judge_use_reply"
         private const val K_REPLY_BASE = "reply_base_url"
+        private const val K_REPLY_PROTOCOL = "reply_protocol"
         private const val K_REPLY_KEY = "reply_key"
         private const val K_REPLY_MODEL = "reply_model"
         private const val K_VISION_BASE = "vision_base_url"
@@ -254,10 +346,27 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
         private const val K_BUBBLE_Y = "bubble_y"
         private const val K_BUBBLE_X = "bubble_x"
         private const val K_AUTO = "auto_analyze"
+        private const val K_CS_MODE = "customer_mode"
+        private const val K_CS_AUTO_SEND = "customer_auto_send"
+        private const val K_CS_REPLY_FIRST = "customer_reply_first"
+        private const val K_CS_REPLY_SECOND = "customer_reply_second"
+        private const val K_CS_CATEGORY = "customer_category"
+        private const val K_CS_GROUP = "customer_wechat_group"
 
         const val PROVIDER_OPENROUTER = "openrouter"
         const val PROVIDER_TYPESAFE = "typesafe"
         const val PROVIDER_CUSTOM = "custom"
+
+        const val PROTOCOL_JEV = "jev"
+        const val PROTOCOL_OPENAI = "openai"
+        const val PROTOCOL_ANTHROPIC = "anthropic"
+
+        const val DEFAULT_JUDGE_BASE_OPENAI = "https://api.openai.com/v1"
+        const val DEFAULT_JUDGE_MODEL_OPENAI = ""
+        const val DEFAULT_JUDGE_BASE_ANTHROPIC = "https://api.anthropic.com"
+        const val DEFAULT_JUDGE_MODEL_ANTHROPIC = ""
+        const val DEFAULT_REPLY_BASE_ANTHROPIC = "https://api.anthropic.com"
+        const val DEFAULT_REPLY_MODEL_ANTHROPIC = ""
 
         const val OCR_MLKIT = "mlkit"
         const val OCR_VISION = "vision"

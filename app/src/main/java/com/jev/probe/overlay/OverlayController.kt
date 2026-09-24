@@ -19,6 +19,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.jev.probe.core.CaptureSource
 import com.jev.probe.core.Analysis
 import com.jev.probe.core.ChatSnapshot
 import com.jev.probe.core.Prefs
@@ -49,6 +50,9 @@ class OverlayController(private val ctx: Context) {
 
     var onManualAnalyze: (() -> Unit)? = null
 
+    /** Header switch: pause/resume capture without hiding the floating bubble. */
+    var onToggleEnabled: (() -> Unit)? = null
+
     /** Bubble menu → file the open conversation as a knowledge-base contact. */
     var onSaveContact: (() -> Unit)? = null
 
@@ -71,6 +75,10 @@ class OverlayController(private val ctx: Context) {
     /** Set when [showReplies] was handed a draftAndRank failure, so the panel
      *  can say so instead of silently showing "（未生成候选回复）". */
     private var replyError: String? = null
+    private var fillAllowed = false
+    private var snapshotInfo: ChatSnapshot? = null
+    private var paused = !prefs.enabled
+    private var enabledChip: TextView? = null
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), ctx.resources.displayMetrics).roundToInt()
@@ -116,6 +124,7 @@ class OverlayController(private val ctx: Context) {
         r.addView(p)
         r.addView(bubbleWrap)
         root = r
+        updateEnabledChip()
         try { wm.addView(r, params) } catch (e: Exception) {
             android.util.Log.e("JEVASSIST", "overlay addView failed: ${e.message}"); root = null
         }
@@ -168,6 +177,7 @@ class OverlayController(private val ctx: Context) {
             setTypeface(typeface, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
+        header.addView(enabledChip())
         header.addView(iconBtn("⚙") { openSettings() })
         header.addView(iconBtn("✕") { toggle() })
         p.addView(header)
@@ -184,7 +194,56 @@ class OverlayController(private val ctx: Context) {
         p.addView(scroll)
         contentBox = content
         panel = p
+        updateEnabledChip()
         return p
+    }
+
+    private fun enabledChip() = TextView(ctx).apply {
+        enabledChip = this
+        textSize = 12f; gravity = Gravity.CENTER
+        setTypeface(typeface, Typeface.BOLD)
+        setPadding(dp(8), dp(4), dp(8), dp(4))
+        setOnClickListener { onToggleEnabled?.invoke() }
+    }
+
+    private fun updateEnabledChip() {
+        enabledChip?.let { chip ->
+            chip.text = if (paused) "恢复" else "暂停"
+            chip.contentDescription = if (paused) "恢复采集和分析" else "暂停采集和分析"
+            chip.setTextColor(if (paused) Color.parseColor("#6B7280") else Color.parseColor("#3A7AFE"))
+            chip.background = card(12, if (paused) Color.parseColor("#F3F4F6") else Color.parseColor("#EAF1FF"), stroke = true)
+        }
+        bubble?.let {
+            it.text = if (paused) "已暂停" else "Jev"
+            it.contentDescription = if (paused) "助手已暂停，点击打开恢复开关" else "聊天助手，点击打开"
+            it.alpha = if (paused) 0.65f else 1f
+        }
+        if (paused) dangerDot?.background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT) }
+    }
+
+    /** Keep the bubble present so the user can resume without reopening settings. */
+    fun setPaused(value: Boolean) {
+        if (value == paused) return
+        paused = value
+        resetForNewConversation()
+        updateEnabledChip()
+        if (paused) renderPaused()
+        else if (contentBox != null) setContent(listOf(bigButton("分析当前对话") { onManualAnalyze?.invoke() }))
+    }
+
+    private fun renderPaused() {
+        setContent(listOf(
+            line("助手已暂停", "#6B7280", 15f, true),
+            hint("不再采集聊天、截图或发起模型请求。已发出的网络请求无法撤回，但返回结果会丢弃。"),
+            bigButton("恢复采集和分析") { onToggleEnabled?.invoke() }
+        ))
+    }
+
+    fun showPaused() {
+        setPaused(true)
+        ensureRoot()
+        updateEnabledChip()
+        renderPaused()
     }
 
     private fun iconBtn(glyph: String, onClick: () -> Unit) = TextView(ctx).apply {
@@ -240,8 +299,14 @@ class OverlayController(private val ctx: Context) {
             setPadding(dp(4), dp(4), dp(4), dp(4))
             layoutParams = FrameLayout.LayoutParams(dp(196), ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(56) }
         }
-        menu.addView(menuItem("截屏识别一次") { root?.removeView(menu); onOcrCapture?.invoke() })
-        menu.addView(menuItem("把当前会话存为联系人") { onSaveContact?.invoke(); root?.removeView(menu) })
+        menu.addView(menuItem(if (paused) "恢复采集和分析" else "暂停采集和分析") {
+            root?.removeView(menu)
+            onToggleEnabled?.invoke()
+        })
+        if (!paused) {
+            menu.addView(menuItem("截屏识别一次") { root?.removeView(menu); onOcrCapture?.invoke() })
+            menu.addView(menuItem("把当前会话存为联系人") { onSaveContact?.invoke(); root?.removeView(menu) })
+        }
         menu.addView(menuItem("打开设置") { openSettings(); root?.removeView(menu) })
         menu.addView(menuItem("隐藏助手（本次）") { hide() })
         menu.addView(menuItem("取消") { root?.removeView(menu) })
@@ -275,6 +340,7 @@ class OverlayController(private val ctx: Context) {
             val maxTop = (screenH * 0.14f).roundToInt()
             if (params.y > maxTop) params.y = maxTop
             panel?.visibility = View.VISIBLE
+            if (paused) renderPaused()
         } else {
             panel?.visibility = View.GONE
             params.x = collapsedX; params.y = collapsedY  // bubble returns to where it was
@@ -286,7 +352,9 @@ class OverlayController(private val ctx: Context) {
     // ------------------------------------------------------------ public API
 
     fun showIdle(title: String?) {
-        ensureRoot(); bubble?.alpha = 0.55f
+        ensureRoot()
+        if (paused) { renderPaused(); return }
+        bubble?.alpha = 0.55f
         // Either there is genuinely nothing to show yet, or the panel is empty
         // for some other reason (root got rebuilt after hide(), leaving
         // contentBox with zero children while lastJudgment still points at a
@@ -310,6 +378,8 @@ class OverlayController(private val ctx: Context) {
         lastFill = null
         noteText = null
         replyError = null
+        fillAllowed = false
+        snapshotInfo = null
         contentBox?.removeAllViews()
     }
 
@@ -324,6 +394,7 @@ class OverlayController(private val ctx: Context) {
     }
 
     fun showLoading() {
+        if (paused) return
         ensureRoot(); bubble?.alpha = 1f
         ctxNotes = 0; ctxHistory = 0   // counts for the round that is starting
         replyError = null              // this round has not failed (yet)
@@ -341,6 +412,13 @@ class OverlayController(private val ctx: Context) {
         noteText = note
     }
 
+    /** Disable direct accessibility fill when the snapshot cannot prove its sender/window. */
+    fun setSnapshotInfo(snapshot: ChatSnapshot) {
+        snapshotInfo = snapshot
+        noteText = snapshot.note
+        fillAllowed = snapshot.source == CaptureSource.ACCESSIBILITY && !snapshot.title.isNullOrBlank()
+    }
+
     /**
      * Take the overlay out of the picture for one screenshot. INVISIBLE, not
      * removed: the window (and everything on it) must survive the round trip.
@@ -349,7 +427,43 @@ class OverlayController(private val ctx: Context) {
         root?.visibility = if (hidden) View.INVISIBLE else View.VISIBLE
     }
 
+    fun showCustomerPlan(
+        title: String,
+        lines: List<String>,
+        reason: String,
+        autoSend: Boolean,
+        onFill: (String) -> Unit,
+        onAutoSend: () -> Unit
+    ) {
+        if (paused) return
+        ensureRoot(); bubble?.alpha = 1f
+        val views = ArrayList<View>()
+        views.add(line("客服 Beta · ${title.ifBlank { "当前会话" }}", "#111827", 15f, true))
+        views.add(hint(reason))
+        if (lines.isEmpty()) {
+            views.add(hint("当前没有需要发送的固定话术。若对方提供联系方式，已保存为待分发线索。"))
+        } else {
+            lines.forEachIndexed { index, text ->
+                views.add(line("第 ${index + 1} 句：${text}", "#111827", 14f))
+                val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+                row.addView(pill("复制", false) { copy(text) })
+                row.addView(pill("填入", true) { onFill(text) })
+                views.add(row)
+            }
+            if (autoSend) {
+                views.add(hint("已开启固定话术自动发送；只会尝试点击可明确识别的“发送”按钮。"))
+            } else {
+                views.add(hint("手动模式：逐句点击“填入”，确认输入框内容后自行发送。"))
+            }
+            if (autoSend) views.add(bigButton("立即执行固定话术") { onAutoSend() })
+        }
+        views.add(hint("联系方式/疑似加微信线索会保存到本机客服线索文件，并提示人工处理。"))
+        setContent(views)
+        if (!expanded) toggle()
+    }
+
     fun showError(msg: String) {
+        if (paused) return
         ensureRoot(); bubble?.alpha = 1f
         setContent(listOf(
             line("出错了", "#DC2626", 14f, true),
@@ -357,11 +471,13 @@ class OverlayController(private val ctx: Context) {
     }
 
     fun showJudgment(a: Analysis) {
+        if (paused) return
         lastJudgment = a
         render(a, generating = true)
     }
 
     fun showReplies(ranked: List<RankedReply>, error: String? = null, onFill: (String) -> Unit) {
+        if (paused) return
         lastFill = onFill
         replyError = error
         val a = lastJudgment?.copy(rankedReplies = ranked) ?: return
@@ -374,7 +490,7 @@ class OverlayController(private val ctx: Context) {
     fun hide() {
         val r = root ?: return
         runCatching { wm.removeView(r) }
-        root = null; bubble = null; panel = null; contentBox = null; dangerDot = null; expanded = false
+        root = null; bubble = null; panel = null; contentBox = null; dangerDot = null; enabledChip = null; expanded = false
     }
 
     // --------------------------------------------------------------- rendering
@@ -385,10 +501,17 @@ class OverlayController(private val ctx: Context) {
     }
 
     private fun render(a: Analysis, generating: Boolean) {
+        if (paused) return
         ensureRoot(); bubble?.alpha = 1f
         panel?.background = card(18, panelBg(), stroke = true) // re-apply in case opacity changed
         val views = ArrayList<View>()
 
+        snapshotInfo?.let { snapshot ->
+            views.add(line("当前会话：${snapshot.title ?: "身份未确认"}", "#374151", 13f, true))
+            views.add(hint("依据：本轮采集的最近 ${snapshot.messages.takeLast(10).size} 条消息；键盘缩放不重算，不是完整聊天记录"))
+            if (!fillAllowed) views.add(hint("仅允许复制：OCR 或会话身份无法再次核验"))
+        }
+        views.add(hint("模型推测不是事实；不确定时先核实，不替对方下结论。"))
         // What context this read was based on (knowledge base / remembered history).
         views.add(hint(
             if (ctxNotes == 0 && ctxHistory == 0) "未用知识库"
@@ -405,8 +528,16 @@ class OverlayController(private val ctx: Context) {
         }
         // Intent headline.
         a.trueIntent?.let {
-            views.add(line("对方真实意图：${INTENT[it.choice] ?: it.choice}", "#111827", 15f, true))
-            views.add(hint("把握 ${(it.confidence * 100).roundToInt()}%"))
+            views.add(line("可能的理解：${INTENT[it.choice] ?: it.choice}", "#111827", 15f, true))
+            if (a.probabilistic) {
+                val confidence = it.confidence.takeIf { value -> value.isFinite() } ?: 0.0
+                views.add(hint("模型置信度 ${(confidence.coerceIn(0.0, 1.0) * 100).roundToInt()}%（非客观正确率）"))
+                if (confidence < 0.6) views.add(hint("信息不足：优先中性回应、核实事实或澄清需求"))
+            } else {
+                val label = mapOf("low" to "低", "medium" to "中", "high" to "高")[a.confidenceLevel] ?: "未说明"
+                views.add(hint("模型自评把握：${label}（非概率）"))
+            }
+            Unit
         }
         // Compact secondary line: needs · action · reply-now.
         val bits = ArrayList<String>()
@@ -416,14 +547,16 @@ class OverlayController(private val ctx: Context) {
         if (bits.isNotEmpty()) views.add(line(bits.joinToString("  ·  "), "#374151", 13f))
         a.tensionResolved?.let { if (it >= 0.7) views.add(line("✓ 紧张已缓解", "#16A34A", 12f)) }
 
+        a.reasoning?.let { views.add(hint("分析依据：${it}")) }
+        if (a.missingFacts.isNotEmpty()) views.add(hint("还需确认：${a.missingFacts.joinToString("；")}"))
         views.add(divider())
-        views.add(line("候选回复（Jev 排序）", "#9CA3AF", 12f))
+        views.add(line(if (a.probabilistic) "候选回复（Jev 排序）" else "候选回复（判断模型排序，无概率）", "#9CA3AF", 12f))
         if (generating) {
             views.add(hint("生成中…"))
         } else {
             val fill = lastFill ?: {}
             a.rankedReplies.forEachIndexed { i, r ->
-                views.add(replyCard(i + 1, r.text, (r.prob * 100).roundToInt(), fill))
+                views.add(replyCard(i + 1, r.text, r.prob?.let { (it.coerceIn(0.0, 1.0) * 100).roundToInt() }, fill))
             }
             if (a.rankedReplies.isEmpty()) {
                 val msg = replyError?.let { "回复接口出错：$it" } ?: "（未生成候选回复）"
@@ -443,7 +576,7 @@ class OverlayController(private val ctx: Context) {
             setPadding(0, 0, 0, dp(6))
         }
         row.addView(TextView(ctx).apply {
-            text = "危险 $lvl/$max"
+            text = "沟通风险估计 $lvl/$max"
             setTextColor(Color.WHITE); textSize = 13f; setTypeface(typeface, Typeface.BOLD)
             setPadding(dp(10), dp(4), dp(10), dp(4))
             background = card(20, color)
@@ -455,7 +588,7 @@ class OverlayController(private val ctx: Context) {
         return row
     }
 
-    private fun replyCard(rank: Int, text: String, pct: Int, onFill: (String) -> Unit): View {
+    private fun replyCard(rank: Int, text: String, pct: Int?, onFill: (String) -> Unit): View {
         val top = rank == 1
         val cardBg = if (top) Color.parseColor("#EAF1FF") else Color.parseColor("#F3F4F6")
         val c = LinearLayout(ctx).apply {
@@ -467,7 +600,7 @@ class OverlayController(private val ctx: Context) {
             ).apply { topMargin = dp(6) }
         }
         c.addView(TextView(ctx).apply {
-            this.text = "#$rank · ${pct}%"; setTextColor(Color.parseColor("#3A7AFE")); textSize = 11f
+            this.text = if (pct == null) "#${rank} · 模型建议顺序" else "#${rank} · 模型相对偏好 ${pct}%"; setTextColor(Color.parseColor("#3A7AFE")); textSize = 11f
             setTypeface(typeface, Typeface.BOLD)
         })
         c.addView(TextView(ctx).apply {
@@ -476,8 +609,10 @@ class OverlayController(private val ctx: Context) {
         })
         val btns = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
         btns.addView(pill("复制", false) { copy(text) })
-        // Fill, then collapse so the input box + keyboard are visible to review/send.
-        btns.addView(pill("填入", true) { android.util.Log.d("JEVASSIST", "overlay: fill tapped"); onFill(text); if (expanded) toggle() })
+        if (fillAllowed) {
+            // Fill, then collapse so the input box + keyboard are visible to review/send.
+            btns.addView(pill("填入", true) { android.util.Log.d("JEVASSIST", "overlay: fill tapped"); onFill(text); if (expanded) toggle() })
+        }
         c.addView(btns)
         return c
     }
@@ -547,14 +682,14 @@ class OverlayController(private val ctx: Context) {
 
     companion object {
         private val INTENT = mapOf(
-            "confirm_you_care" to "确认你在不在乎", "vent_anger" to "在发泄情绪",
+            "unknown" to "信息不足，暂不判断", "confirm_you_care" to "确认你在不在乎", "vent_anger" to "在发泄情绪",
             "request_action" to "要你办事", "seek_explanation" to "要个解释",
             "casual_chat" to "随便聊聊", "close_topic" to "事情过去了")
         private val NEEDS = mapOf(
-            "apology" to "道歉", "action" to "具体行动", "explanation" to "解释",
+            "unknown" to "先澄清需求", "apology" to "道歉", "action" to "具体行动", "explanation" to "解释",
             "care" to "你的在乎", "nothing" to "（不用做什么）")
         private val ACTION = mapOf(
-            "check_history" to "翻聊天记录", "apologize" to "先道歉", "give_commitment" to "给承诺",
+            "clarify" to "先澄清", "check_history" to "翻聊天记录", "apologize" to "先道歉", "give_commitment" to "给承诺",
             "explain" to "解释清楚", "acknowledge" to "接住情绪", "say_less" to "少说两句",
             "make_plan" to "定个安排")
     }

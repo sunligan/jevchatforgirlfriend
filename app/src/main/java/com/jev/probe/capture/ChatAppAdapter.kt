@@ -508,3 +508,54 @@ class XAdapter : ChatAppAdapter {
 
     private data class Row(val top: Int, val sender: String, val text: String)
 }
+
+/**
+ * Douyin private-message beta adapter.
+ *
+ * It intentionally uses conservative heuristics instead of hard-coded view IDs:
+ * Douyin changes Compose/resource trees frequently. A chat page must expose an
+ * editable composer plus at least one message-like text node. Ambiguous screens
+ * return null and are left for manual testing rather than auto-sending.
+ */
+class DouyinAdapter(override val pkg: String = "com.ss.android.ugc.aweme") : ChatAppAdapter {
+    override fun extract(root: AccessibilityNodeInfo, res: Resources): ChatSnapshot? {
+        val width = res.displayMetrics.widthPixels
+        val height = res.displayMetrics.heightPixels
+        val texts = ArrayList<Row>()
+        var hasComposer = false
+        var firstTop = Int.MAX_VALUE
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.addLast(root)
+        var guard = 0
+        while (stack.isNotEmpty() && guard < 8000) {
+            guard++
+            val node = stack.removeLast()
+            val cls = node.className?.toString().orEmpty()
+            if (node.isEditable || cls == "android.widget.EditText") hasComposer = true
+            val t = node.text?.toString()?.trim()
+            if (!t.isNullOrBlank() && t.length <= 500) {
+                val b = Rect(); node.getBoundsInScreen(b)
+                val lower = t.lowercase()
+                val isChrome = t in setOf("发送", "Send", "私信", "消息", "聊天", "更多") ||
+                    lower.contains("按住说话") || lower.contains("输入") ||
+                    looksLikeTimestamp(t)
+                val inMessageArea = b.top > (height * 0.12f).toInt() && b.bottom < (height * 0.86f).toInt()
+                if (!isChrome && inMessageArea && b.width() > 0 && b.height() > 0) {
+                    texts.add(Row(b.top, b.centerX(), t))
+                    if (b.top < firstTop) firstTop = b.top
+                }
+            }
+            for (i in node.childCount - 1 downTo 0) node.getChild(i)?.let { stack.addLast(it) }
+        }
+        if (!hasComposer) return null
+        val title = findTitleInActionBar(root, firstTop, width, res, 0.15, 0.85)
+        if (texts.isEmpty()) return ChatSnapshot(title, emptyList(), note = "抖音 Beta：当前会话正文未稳定读取")
+        texts.sortBy { it.top }
+        val messages = texts.distinctBy { "${it.top}:${it.center}:${it.text}" }.map { row ->
+            Msg(if (row.center > width / 2) "me" else "other", row.text)
+        }
+        return ChatSnapshot(title, messages, note = "抖音 Beta：固定话术模式")
+    }
+
+    private data class Row(val top: Int, val center: Int, val text: String)
+}

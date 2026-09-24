@@ -27,8 +27,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: Prefs
     private lateinit var container: LinearLayout
-    private val a11yComponent =
-        "com.jev.probe/com.google.android.accessibility.selecttospeak.SelectToSpeakService"
+    private val a11yComponent get() =
+        "${packageName}/com.google.android.accessibility.selecttospeak.SelectToSpeakService"
 
     private val accent = Color.parseColor("#3A7AFE")
     private val green = Color.parseColor("#16A34A")
@@ -62,9 +62,15 @@ class MainActivity : AppCompatActivity() {
     private fun build() {
         container.removeAllViews()
 
-        container.addView(text("Jev 聊天助手", 24f, ink, bold = true))
+        container.addView(text(getString(R.string.app_name), 24f, ink, bold = true))
         container.addView(text("在聊天 App 旁读对方消息（已支持微信、QQ、X、飞书），给出判断和候选回复。发送始终由你手动点。",
             13f, sub).apply { setPadding(0, dp(6), 0, dp(16)) })
+
+        container.addView(text("分析会把当前对话及选中的知识背景发送给你配置的模型服务。建议先用非敏感测试对话，并设置会话白名单。",
+            12f, sub).apply { setPadding(0, 0, 0, dp(10)) })
+        if (BuildConfig.DEBUG) container.addView(text(
+            "测试版 ${BuildConfig.VERSION_NAME}：与原版独立。请只开启一个版本的无障碍服务；发送始终由你手动确认。",
+            12f, sub).apply { setPadding(0, 0, 0, dp(10)) })
 
         val a11y = isA11yEnabled()
         val overlay = Settings.canDrawOverlays(this)
@@ -223,6 +229,6 @@ class MainActivity : AppCompatActivity() {
     private fun isA11yEnabled(): Boolean {
         val enabled = Settings.Secure.getString(contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
-        return enabled.contains(a11yComponent)
+        return enabled.split(':').any { it == a11yComponent }
     }
 }

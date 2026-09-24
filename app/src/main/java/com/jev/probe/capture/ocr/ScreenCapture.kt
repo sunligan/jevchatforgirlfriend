@@ -35,7 +35,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ScreenCapture(
     private val service: AccessibilityService,
     private val hideOverlay: () -> Unit = {},
-    private val restoreOverlay: () -> Unit = {}
+    private val restoreOverlay: () -> Unit = {},
+    private val canCapture: () -> Boolean = { true },
+    private val activeRoot: () -> android.view.accessibility.AccessibilityNodeInfo? = { service.rootInActiveWindow }
 ) {
 
     sealed class Result {
@@ -64,6 +66,7 @@ class ScreenCapture(
 
     /** Take one screenshot. [onResult] runs on the main thread, exactly once. */
     fun capture(onResult: (Result) -> Unit) {
+        if (!canCapture()) { onResult(Result.Failed(CODE_CANCELLED, "已取消截屏")); return }
         val now = SystemClock.elapsedRealtime()
         val need = requiredInterval()
         if (now - lastAttemptAt < need) {
@@ -84,7 +87,10 @@ class ScreenCapture(
 
         // Hide the bubble, give the compositor a frame to drop it, then shoot.
         runCatching { hideOverlay() }
-        main.postDelayed({ shoot(finish, done) }, HIDE_SETTLE_MS)
+        main.postDelayed({
+            if (canCapture()) shoot(finish, done)
+            else finish(Result.Failed(CODE_CANCELLED, "已取消截屏"))
+        }, HIDE_SETTLE_MS)
     }
 
     private fun shoot(finish: (Result) -> Unit, done: AtomicBoolean) {
@@ -115,7 +121,7 @@ class ScreenCapture(
         // some OEM builds that refuse a whole-display capture. Fall back to the
         // display shot when the window id is unknown or the call is unavailable.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val node = runCatching { service.rootInActiveWindow }.getOrNull()
+            val node = runCatching { activeRoot() }.getOrNull()
             val windowId = node?.windowId
             if (windowId != null && windowId != -1) {
                 windowBounds = runCatching {
@@ -174,6 +180,7 @@ class ScreenCapture(
         private const val TAG = "JEVASSIST"
 
         /** Our own throttle, not a platform code. */
+        const val CODE_CANCELLED = -3
         const val CODE_THROTTLED = -1
         /** Our own watchdog: the platform callback never arrived. */
         const val CODE_TIMEOUT = -2
@@ -201,6 +208,7 @@ class ScreenCapture(
 
         /** Platform error codes, in words a user can act on. */
         fun humanMessage(code: Int): String = when (code) {
+            CODE_CANCELLED -> "截屏已取消（助手已暂停或窗口已变化）"
             CODE_THROTTLED -> "截屏太频繁"
             CODE_TIMEOUT -> "截屏超时"
             1 -> "截屏失败：内部错误（系统拒绝，可能是该无障碍服务不被允许截屏）"

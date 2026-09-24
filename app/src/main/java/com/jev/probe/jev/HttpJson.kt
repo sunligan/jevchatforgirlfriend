@@ -41,6 +41,8 @@ class ApiException(
  */
 object HttpJson {
 
+    enum class AuthStyle { BEARER, ANTHROPIC_API_KEY }
+
     private const val MAX_ATTEMPTS = 3
 
     /**
@@ -52,11 +54,13 @@ object HttpJson {
         key: String,
         body: JSONObject,
         route: String,
-        extraHeaders: Map<String, String> = emptyMap()
+        extraHeaders: Map<String, String> = emptyMap(),
+        authStyle: AuthStyle = AuthStyle.BEARER
     ): JSONObject {
         var attempt = 0
         var last: ApiException? = null
         while (attempt < MAX_ATTEMPTS) {
+            if (Thread.currentThread().isInterrupted) throw InterruptedException("Request cancelled")
             var conn: HttpURLConnection? = null
             try {
                 conn = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -64,7 +68,12 @@ object HttpJson {
                     connectTimeout = 15000
                     readTimeout = 40000
                     doOutput = true
-                    setRequestProperty("Authorization", "Bearer $key")
+                    instanceFollowRedirects = false // never forward credentials to an unverified redirect target
+                    if (authStyle == AuthStyle.ANTHROPIC_API_KEY) {
+                        setRequestProperty("x-api-key", key)
+                    } else {
+                        setRequestProperty("Authorization", "Bearer $key")
+                    }
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
                     extraHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
                 }
@@ -90,11 +99,15 @@ object HttpJson {
                 if (text.isBlank()) throw ApiException(route, code, "响应体为空")
                 return JSONObject(text)
             } catch (e: ApiException) {
-                if (e.status != null && e.status in 400..499) throw e  // client error: no retry
+                if (e.status != null && e.status in 300..499) throw e  // redirect/client error: no retry
                 last = e
                 attempt++
                 if (attempt < MAX_ATTEMPTS) Thread.sleep(500L * (1L shl attempt))
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw e
             } catch (e: Exception) {
+                if (Thread.currentThread().isInterrupted) throw InterruptedException("Request cancelled")
                 last = ApiException(route, null, describe(e))
                 attempt++
                 if (attempt < MAX_ATTEMPTS) Thread.sleep(500L * (1L shl attempt))
@@ -115,7 +128,7 @@ object HttpJson {
 
     /** OpenRouter wants attribution headers; other hosts reject unknown ones politely. */
     fun headersFor(url: String): Map<String, String> =
-        if (url.contains("openrouter.ai", ignoreCase = true))
+        if (runCatching { java.net.URI(url).host.equals("openrouter.ai", true) }.getOrDefault(false))
             mapOf("HTTP-Referer" to "https://jev-assistant.local", "X-Title" to "Jev Assistant")
         else emptyMap()
 

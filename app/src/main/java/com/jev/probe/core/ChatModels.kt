@@ -24,17 +24,20 @@ data class BubbleRect(val rect: Rect, val side: String)
  * [note] is a caveat about how this snapshot was produced, shown verbatim in
  * the analysis panel (OCR captures cannot tell who said what).
  */
+enum class CaptureSource { ACCESSIBILITY, BUBBLE_OCR, SCREEN_OCR }
+
 data class ChatSnapshot(
     val title: String?,
     val messages: List<Msg>,
     val bubbleRects: List<BubbleRect> = emptyList(),
-    val note: String? = null
+    val note: String? = null,
+    val source: CaptureSource = CaptureSource.ACCESSIBILITY
 ) {
     val latestFrom: String? get() = messages.lastOrNull()?.side
 
     /** A stable signature of the last few messages, to detect real changes. */
     fun signature(): String =
-        messages.takeLast(6).joinToString("|") { "${it.side}:${it.text}" }
+        messages.takeLast(10).joinToString("") { "${it.side.length}:${it.side}${it.text.length}:${it.text}" }
 }
 
 /** Jev's judgment result for one snapshot, plus the ranked candidate replies. */
@@ -48,9 +51,13 @@ data class Analysis(
     val literalQuestion: Double?,
     val rankedReplies: List<RankedReply>,
     val latencyMs: Long,
-    val error: String? = null
+    val error: String? = null,
+    val probabilistic: Boolean = true,
+    val confidenceLevel: String? = null,
+    val reasoning: String? = null,
+    val missingFacts: List<String> = emptyList()
 )
 
 data class Choice(val choice: String, val confidence: Double, val probabilities: Map<String, Double>)
 data class Score(val score: Double, val confidence: Double, val maxLevel: Int)
-data class RankedReply(val text: String, val prob: Double)
+data class RankedReply(val text: String, val prob: Double?)
