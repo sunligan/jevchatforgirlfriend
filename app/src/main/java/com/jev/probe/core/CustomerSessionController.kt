@@ -17,7 +17,11 @@ data class CustomerConfig(
 data class CustomerAction(
     val leads: List<CustomerLead>,
     val plan: CustomerReplyPlan,
+    /** Auto-send is available for this plan, so the panel may offer it. */
     val autoSend: Boolean,
+    /** And this snapshot is the one that should actually fire it. Suppressed
+     *  once the same plan has been dispatched — see [CustomerSessionController]. */
+    val dispatchNow: Boolean,
     val notify: String?
 )
 
@@ -47,9 +51,14 @@ object CustomerSendSchedule {
  */
 class CustomerSessionController {
     private var scanned: List<String> = emptyList()
+    /** Signature of the plan already dispatched in this conversation. */
+    private var dispatched: String? = null
 
     /** Call when the conversation changes; the next scan then starts fresh. */
-    fun reset() { scanned = emptyList() }
+    fun reset() {
+        scanned = emptyList()
+        dispatched = null
+    }
 
     fun onSnapshot(snapshot: ChatSnapshot, cfg: CustomerConfig): CustomerAction {
         val title = snapshot.title.orEmpty()
@@ -66,10 +75,27 @@ class CustomerSessionController {
             CustomerLeadParser.extract(it, title, cfg.category, cfg.targetGroup)
         }
         val plan = CustomerReplyLogic.plan(snapshot.messages, cfg.replyFirst, cfg.replySecond)
+        val autoSend = cfg.autoSend && !plan.needsHuman && plan.lines.isNotEmpty()
+        // Fire once per distinct plan per conversation.
+        //
+        // Without this latch the only thing standing between two auto-sends is
+        // CustomerReplyLogic noticing its own line already in the tree, and on
+        // Douyin "mine" is decided by `center > width/2` — an adapter heuristic
+        // the QQ adapter's own comments record as unreliable, because a long
+        // message's centre crosses mid-screen. During the window where a sent
+        // bubble has not rendered yet (or renders left of centre) the plan looks
+        // unchanged and unsent, so it would be dispatched again; fillInput's
+        // draft guard does not catch it either, because a successful send is
+        // exactly what empties the composer.
+        val signature = plan.lines.joinToString("\u0000")
+        val dispatchNow = autoSend && signature != dispatched
+        if (dispatchNow) dispatched = signature
+
         return CustomerAction(
             leads = leads,
             plan = plan,
-            autoSend = cfg.autoSend && !plan.needsHuman && plan.lines.isNotEmpty(),
+            autoSend = autoSend,
+            dispatchNow = dispatchNow,
             notify = notification(leads, cfg.targetGroup)
         )
     }

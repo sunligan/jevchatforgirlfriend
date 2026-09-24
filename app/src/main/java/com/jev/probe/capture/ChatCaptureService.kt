@@ -27,6 +27,7 @@ import com.jev.probe.core.CustomerLead
 import com.jev.probe.core.CustomerLeadStore
 import com.jev.probe.core.CustomerSendSchedule
 import com.jev.probe.core.CustomerSessionController
+import com.jev.probe.core.MoneyGuard
 import com.jev.probe.core.Msg
 import com.jev.probe.core.Prefs
 import com.jev.probe.core.SnapshotChange
@@ -49,9 +50,13 @@ import java.util.concurrent.Future
  * Per-app node rules live in [ChatAppAdapter] implementations; everything here
  * is app-agnostic.
  *
- * It never sends a message. The only write action is ACTION_SET_TEXT (or a
- * clipboard PASTE fallback) to fill the chat input box when the user taps
- * "填入"; the user still presses send.
+ * Sending. The personal copilot never sends: its only write action is
+ * ACTION_SET_TEXT (or a clipboard PASTE fallback) to fill the chat input box
+ * when the user taps "填入", and the user still presses send. The customer beta
+ * is the single exception — [clickSendIfSafe] may press a send button, for
+ * pre-configured fixed text only, never for model output, and only behind two
+ * default-off switches (`customerMode`, `customerAutoSend`) plus a hard
+ * `isDouyin` package gate. WeChat / QQ / X / Feishu cannot reach that path.
  */
 open class ChatCaptureService : AccessibilityService() {
 
@@ -87,6 +92,14 @@ open class ChatCaptureService : AccessibilityService() {
     private var stopEnabledObserver: (() -> Unit)? = null
     private val customerLeads by lazy { CustomerLeadStore(this) }
     private val customerSession = CustomerSessionController()
+    /**
+     * Auto-send steps still waiting on their delay. Kept as named Runnables so
+     * [invalidateConversation] can cancel them: an anonymous `postDelayed` is
+     * unreachable, and leaving one alive means it fires after the operator has
+     * switched to a different conversation — currently caught downstream by
+     * [validatedInput] re-checking the ticket, which is a safety net, not a plan.
+     */
+    private val pendingAutoSends = ArrayList<Runnable>()
     /** Created on first use, released in [onDestroy]; a ToneGenerator per lead
      *  leaks the native audio resource it holds. */
     private var toneGen: ToneGenerator? = null
@@ -108,6 +121,7 @@ open class ChatCaptureService : AccessibilityService() {
         main.removeCallbacks(captureDebounce)
         captureScheduled = false
         main.removeCallbacks(debounce)
+        cancelAutoSends()   // a pending fixed-text send must not survive its conversation
         conversationGuard.invalidate()
         customerSession.reset()   // the next conversation's leads are scanned from scratch
         analysisJob?.cancel(true)
@@ -411,9 +425,12 @@ open class ChatCaptureService : AccessibilityService() {
         overlay?.showCustomerPlan(
             snapshot.title.orEmpty(), action.plan.lines, action.plan.reason, action.autoSend,
             onFill = { text -> fillInput(text, ticket) },
+            // A human pressing the button is an explicit decision: never latched.
             onAutoSend = { if (action.autoSend) scheduleAutoSend(action.plan.lines, ticket) }
         )
-        if (allowAutoAnalyze && action.autoSend) scheduleAutoSend(action.plan.lines, ticket)
+        // The automatic path is latched — one dispatch per distinct plan per
+        // conversation, see CustomerSessionController.
+        if (allowAutoAnalyze && action.dispatchNow) scheduleAutoSend(action.plan.lines, ticket)
         return true
     }
 
@@ -426,11 +443,20 @@ open class ChatCaptureService : AccessibilityService() {
     )
 
     /** One schedule, one place — the "立即执行" button and the automatic path
-     *  used to carry byte-identical copies of this loop. */
+     *  used to carry byte-identical copies of this loop. Replaces any batch
+     *  still waiting, so a re-trigger cannot stack a second send on the first. */
     private fun scheduleAutoSend(lines: List<String>, ticket: ConversationGuard.Ticket) {
+        cancelAutoSends()
         CustomerSendSchedule.delays(lines.size).forEachIndexed { index, delay ->
-            main.postDelayed({ fillInput(lines[index], ticket, autoSend = true) }, delay)
+            val task = Runnable { fillInput(lines[index], ticket, autoSend = true) }
+            pendingAutoSends.add(task)
+            main.postDelayed(task, delay)
         }
+    }
+
+    private fun cancelAutoSends() {
+        pendingAutoSends.forEach { main.removeCallbacks(it) }
+        pendingAutoSends.clear()
     }
 
     /**
@@ -740,7 +766,14 @@ open class ChatCaptureService : AccessibilityService() {
         acceptSnapshot(snapshot, pkg, windowId, manual, capturePolicy.allowAuto(SystemClock.elapsedRealtime()))
     }
 
-    /** Main-thread writes only. Each step revalidates owner, messages, and draft. Never sends. */
+    /**
+     * Main-thread writes only. Each step revalidates owner, messages, and draft.
+     *
+     * Does not itself send: with [autoSend] it hands off to [clickSendIfSafe]
+     * once the text is verified in the box, and that function applies its own
+     * gates. Without [autoSend] the text sits in the composer and the user
+     * presses send.
+     */
     private fun fillInput(text: String, ticket: ConversationGuard.Ticket, autoSend: Boolean = false) {
         val edit = validatedInput(ticket)
         if (edit == null) { overlay?.toast("会话已变化或身份无法确认，请重新分析；可手动复制"); return }
@@ -776,6 +809,16 @@ open class ChatCaptureService : AccessibilityService() {
         }, 150)
     }
 
+    /**
+     * The only click this app ever performs.
+     *
+     * Hard constraints 2 ("never press send") and 3 ("never touch money") both
+     * come down to this function, so it fails closed at every step: customer
+     * mode on, auto-send on, the ticket still current, Douyin in the foreground,
+     * the tree fully scanned, exactly one visible clickable node labelled
+     * "发送"/"Send", and no payment control anywhere near it. Anything else
+     * leaves the text filled in the composer and hands it to a human.
+     */
     private fun clickSendIfSafe(ticket: ConversationGuard.Ticket) {
         if (!prefs.customerMode || !prefs.customerAutoSend || !isCurrent(ticket)) return
         val root = foregroundRoot() ?: return
@@ -793,10 +836,51 @@ open class ChatCaptureService : AccessibilityService() {
             }
             for (i in node.childCount - 1 downTo 0) node.getChild(i)?.let { stack.addLast(it) }
         }
-        if (found?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true) {
+        // The node cap can end the walk with entries still queued, and what was
+        // scanned then says nothing about the rest of the tree: the "only one
+        // send button" proof above is incomplete, so it must not be acted on.
+        // findEditable already applies exactly this rule.
+        if (stack.isNotEmpty()) { overlay?.toast("界面节点过多，无法确认发送按钮，已停止自动发送"); return }
+        val target = found
+        if (target == null) { overlay?.toast("未确认发送按钮，已填入但未自动发送"); return }
+        if (nearMoneyControls(target)) { overlay?.toast("发送按钮位于支付/礼物类界面内，已停止自动发送"); return }
+        if (target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
             overlay?.toast("固定话术已自动发送")
         } else overlay?.toast("未确认发送按钮，已填入但未自动发送")
     }
+
+    /**
+     * Hard constraint 3 says never touch transfer / red packet / payment UI.
+     * Nothing in the code knew money existed until now: the only thing between
+     * an auto-send click and a Douyin pay / gift / DOU+ sheet was the exact
+     * "发送" label match, which is coincidence rather than design.
+     *
+     * Scope is the candidate's own subtree plus its ancestor chain, NOT the
+     * whole tree. Douyin parks a gift entry beside the composer, so a
+     * whole-tree scan would refuse every legitimate send. An ancestor chain is
+     * layout chrome in the normal case; when the button lives inside a payment
+     * or gift sheet, that sheet is on the chain.
+     */
+    private fun nearMoneyControls(node: AccessibilityNodeInfo): Boolean {
+        val stack = ArrayDeque<AccessibilityNodeInfo>(); stack.addLast(node)
+        var guard = 0
+        while (stack.isNotEmpty() && guard++ < 200) {
+            val n = stack.removeLast()
+            if (hasMoneyWord(n)) return true
+            for (i in n.childCount - 1 downTo 0) n.getChild(i)?.let { stack.addLast(it) }
+        }
+        var parent = runCatching { node.parent }.getOrNull()
+        var up = 0
+        while (parent != null && up++ < 12) {
+            if (hasMoneyWord(parent)) return true
+            val current = parent
+            parent = runCatching { current.parent }.getOrNull()
+        }
+        return false
+    }
+
+    private fun hasMoneyWord(n: AccessibilityNodeInfo): Boolean =
+        MoneyGuard.mentions(n.text?.toString(), n.contentDescription?.toString())
 
     private fun validatedInput(ticket: ConversationGuard.Ticket): AccessibilityNodeInfo? {
         if (!connected || !prefs.enabled || !isCurrent(ticket)) return null

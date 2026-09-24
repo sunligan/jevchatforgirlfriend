@@ -94,4 +94,51 @@ class CustomerSessionControllerTest {
         // fillInput's worst path is SET_TEXT → FOCUS → PASTE → verify at 3 × 150 ms.
         assertTrue(CustomerSendSchedule.INTERVAL_MS > 450L)
     }
+
+    // ---- the dispatch latch. Douyin decides "mine" by centre-of-screen, so the
+    // ---- window before a sent bubble renders looks exactly like "not sent yet".
+    @Test fun autoSendFiresOncePerPlanPerConversation() {
+        val c = CustomerSessionController()
+        val auto = cfg.copy(autoSend = true)
+        val s = snap("other" to "你好")
+        assertTrue(c.onSnapshot(s, auto).dispatchNow)
+        assertFalse(c.onSnapshot(s, auto).dispatchNow)
+        assertFalse(c.onSnapshot(s, auto).dispatchNow)
+        // The panel keeps offering the button: a human press is never latched.
+        assertTrue(c.onSnapshot(s, auto).autoSend)
+    }
+
+    @Test fun aChangedPlanMayDispatchAgain() {
+        val c = CustomerSessionController()
+        val auto = cfg.copy(autoSend = true)
+        assertTrue(c.onSnapshot(snap("other" to "你好"), auto).dispatchNow)
+        // Line one is now on screen as sent, so the plan shrinks to line two.
+        val second = c.onSnapshot(
+            snap("other" to "你好", "me" to "您好", "other" to "在吗"), auto)
+        assertEquals(listOf("请留下联系方式"), second.plan.lines)
+        assertTrue(second.dispatchNow)
+        assertFalse(c.onSnapshot(
+            snap("other" to "你好", "me" to "您好", "other" to "在吗"), auto).dispatchNow)
+    }
+
+    @Test fun resetClearsTheDispatchLatch() {
+        val c = CustomerSessionController()
+        val auto = cfg.copy(autoSend = true)
+        assertTrue(c.onSnapshot(snap("other" to "你好"), auto).dispatchNow)
+        c.reset()
+        assertTrue(c.onSnapshot(snap("other" to "你好"), auto).dispatchNow)
+    }
+
+    @Test fun manualModeNeverDispatches() {
+        val a = CustomerSessionController().onSnapshot(snap("other" to "你好"), cfg)
+        assertFalse(a.autoSend)
+        assertFalse(a.dispatchNow)
+    }
+
+    @Test fun unconfiguredScriptNeverDispatches() {
+        val a = CustomerSessionController().onSnapshot(
+            snap("other" to "你好"), cfg.copy(autoSend = true, replyFirst = "", replySecond = ""))
+        assertFalse(a.dispatchNow)
+        assertTrue(a.plan.needsHuman)
+    }
 }

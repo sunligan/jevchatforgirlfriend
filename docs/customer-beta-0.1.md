@@ -24,8 +24,22 @@
 - 设置中有“固定话术自动发送”开关，默认关闭。
 - 关闭：显示每句固定话术，可分别复制或填入；发送由人确认。
 - 开启：只对固定话术逐句填入，并尝试点击可明确识别的“发送”按钮。
-- 找不到唯一发送按钮、识别到多个发送按钮或会话状态不确定：停止自动发送，只保留已填入内容并提示人工处理。
 - 不使用模型自由生成内容自动发送。
+
+点击发送前必须全部通过下面这些闸，任何一条不满足就只保留已填入内容并提示人工处理：
+
+1. `customerMode` 与 `customerAutoSend` 都开着，且会话 ticket 仍然有效；
+2. 前台包名是抖音（`isDouyin` 硬门，微信 / QQ / X / 飞书根本走不到点击路径）；
+3. **整棵树扫完**——节点数超过 8000 上限导致遍历被截断时，「唯一发送按钮」这个结论是不成立的，直接停手（同一规则 `findEditable` 早就在用）；
+4. 全树恰好一个 label 精确等于「发送」/「Send」、可见且可点击的节点；
+5. **该节点的子树与祖先链上没有任何金钱相关词**（支付/付款/转账/红包/收款/打赏/礼物/充值/钱包/结算/订单/pay/wallet/gift/transfer/checkout）。这是硬约束 3「不碰钱」在代码里的唯一实现，之前是零。只查按钮附近而不查全树，因为抖音输入框旁边常驻礼物入口，全树扫描会让自动发送永远不触发。
+
+另外还有两道防重发：
+
+- **同一会话内同一个 plan 只自动派发一次**（`CustomerSessionController` 的 latch）。不加这道闸的话，唯一的去重是「看到自己那句已出现在树里」，而抖音的「我/对方」是按 `center > width/2` 判的——发出的气泡还没渲染、或渲染位置没过中线时，plan 看起来没变也没发过，就会再发一次；`fillInput` 的草稿保护也拦不住，因为发送成功恰好会清空输入框。plan 变化（例如第 1 句已发出、只剩第 2 句）时允许再次派发。
+- **延时任务随会话失效一起取消**。自动发送的 900ms 排程用具名 Runnable 保存，`invalidateConversation()` 里 remove 掉；切会话/暂停后不会再有残留任务触发。之前投的是匿名 Runnable，没人能取消，只靠下游重新校验兜底。
+
+手动点「立即执行固定话术」不受 latch 限制——那是人的显式决定。
 
 ### 联系方式线索
 
@@ -83,3 +97,24 @@
 `isWeChatHint` 之前只有测试在调，生产路径用的是 `phone != null || wechat != null` 的反面，两者不等价；现在通知文案由控制器的 `concrete`/`hinted` 计数决定，语义与它一致。
 
 **已知取舍**：暗示词表里有裸「微信」，所以客户说「我微信上问过了」这类没有留号码的消息也会进队列并响铃。这是文档里「仅有暗示 → 提示人工处理」的既定行为，宁可多提示不要漏号码；如果实际太吵，收窄成「加微信/留个微信/微信号」即可。
+
+---
+
+## 修订二（2026-09-24，硬约束合规审计后）
+
+一轮只读审计逐条核查了 CLAUDE.md 的 7 条硬约束。结论：约束 1（不 hook）、4 的日志/git/字面量三项、6（UTF-8）**守住**；约束 2 有风险；约束 3「不碰钱」**零实现**；约束 5 的线索删除入口缺失（已在修订一补上）。本轮修掉剩下的：
+
+| 编号 | 问题 | 修复 |
+|---|---|---|
+| A | `clickSendIfSafe` 的遍历上限是 `while (stack.isNotEmpty() && guard++ < 8000)`，超限时带着**非空 stack** 退出，「唯一发送按钮」的证明不完整，然后照样点。正确写法就在 30 行外的 `findEditable`：`return if (stack.isEmpty()) found else null` | 遍历结束后 `if (stack.isNotEmpty())` 直接停手并提示「界面节点过多」 |
+| B | 硬约束 3「不碰钱」在代码里**零实现**：全文件 grep `支付\|转账\|红包\|打赏\|礼物` = 0 命中。自动发送与抖音支付 / DOU+ / 打赏 / 礼物流程之间唯一的距离是「发送」标签精确相等 | 新增 `core/SendSafety.kt` 的 `MoneyGuard`（纯函数，可单测）；点击前检查候选按钮的**子树 + 祖先链**（各限 200 / 12 层），命中即拒绝。不查全树，否则抖音输入框旁常驻的礼物入口会让自动发送永远不触发 |
+| C | 自动发送无冷却，重发窗口真实存在：去重依赖 `plan` 看到自己那句已出现，而抖音的「我」是按 `center > width/2` 判的（QQ 适配器注释明确记录此法不可靠）；气泡未渲染完成的窗口内 plan 看起来没变也没发过 → 再发一次。`fillInput` 的草稿闸也放行，因为发送成功恰好清空输入框 | `CustomerSessionController` 加 dispatch latch：同一会话内同一 plan 只自动派发一次，plan 变化才允许再派。`CustomerAction` 拆成 `autoSend`（面板是否提供按钮）与 `dispatchNow`（本次是否自动触发），手动点按不受 latch 限制 |
+| D | 自动发送的 900ms 延时任务投的是匿名 Runnable，`invalidateConversation()` 取消不到，切会话后照跑，只靠下游 `validatedInput` 重校验兜底 | 改成具名 Runnable 存进 `pendingAutoSends`，`invalidateConversation()` 里 `cancelAutoSends()`；`scheduleAutoSend` 每次先清掉上一批，避免叠加 |
+| E | 两处注释说谎：类 KDoc `It never sends a message`、`fillInput` KDoc `Never sends.`。都已经是假的，下一个人会在错误前提下改这段代码 | 改成如实描述：个人副驾从不发送；客服 Beta 是唯一例外，并点名两个默认关闭的开关 + `isDouyin` 硬门 |
+| F | `Prefs` KDoc 写 `stored in app-private SharedPreferences (not world-readable…)`，本身准确但比 CLAUDE.md 第 5 条「或 App **加密**设置项」弱一档，容易被当成已达标 | KDoc 明确写「**明文存储**，加密那半条未实现」，并列出实际缓解项（`MODE_PRIVATE`、`allowBackup=false`）与残余风险（root / 设备被攻破可读 XML） |
+
+审计确认干净、本轮未动的部分：密钥从不进日志（只打 `.length`）· `HttpJson` 的「前 120 字」取的是**响应体**不是请求头，不会回显密钥 · `instanceFollowRedirects = false` 不把凭证转发给未验证的重定向目标 · `sk-or-` 在全部 git 历史与 5 个 APK 二进制（含解包扫 dex/resources）里 0 命中 · 聊天正文 / 联系人名 / 会话标题都不进 logcat · 文件 IO 全部显式 UTF-8 · 无 hook / 反射 / 读别家数据库 · `config_disguised.xml` **未声明 `canPerformGestures`**，坐标点击这条路根本不可用（全仓 `dispatchGesture` 0 命中）。
+
+**仍未实现、需要真机才能做的**：抖音适配器的 me/other 判定（`center > width/2`）与 chrome 黑名单，以及 `clickSendIfSafe` 的几何约束（按钮是否真的在输入框同一水平带）。这两项都要先拿到目标抖音版本的 `uiautomator dump`，现在改等于蒙。在拿到之前不要开自动发送。
+
+**一个灰色地带，代码层面无法解决**：无障碍服务注册在 `com.google.android.accessibility.selecttospeak` 包名下，这是绕微信节点混淆的手段。它没改微信、没注入微信进程，约束 1 字面守住，但性质上是**身份伪装以绕过目标 App 的无障碍检测**——合规与 ToS 层面是另一回事。

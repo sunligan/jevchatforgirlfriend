@@ -12,8 +12,18 @@ import com.jev.probe.jev.ChatProtocol
  * the relationship description used in Jev's state, the conversation whitelist,
  * plus the context (D stage) and OCR (B stage) switches.
  *
- * Key handling: stored in app-private SharedPreferences (not world-readable,
- * never logged, never in code/git). Only key *lengths* are ever logged.
+ * Key handling — what is and is not true:
+ * - **Plaintext at rest.** `judge_key` / `reply_key` / `vision_key` sit in
+ *   `shared_prefs/jev_assistant.xml` as ordinary strings. There is no
+ *   EncryptedSharedPreferences and no `security-crypto` dependency, so
+ *   CLAUDE.md constraint 5's "或 App **加密**设置项" half is NOT implemented;
+ *   only its "never logged, never in code/git" halves are.
+ * - Not world-readable (`MODE_PRIVATE`), and `allowBackup="false"` in the
+ *   manifest blocks `adb backup` from extracting it.
+ * - A rooted device, a compromised OS user, or an app holding the right
+ *   permission can still read the XML. Treat these keys as spendable.
+ * - Only key *lengths* are ever logged — see [migrateIfNeeded] and the settings
+ *   screen's diagnostic line.
  */
 class Prefs private constructor(private val sp: SharedPreferences, prefsName: String) {
     constructor(context: Context, prefsName: String = PREFS_MAIN) :
