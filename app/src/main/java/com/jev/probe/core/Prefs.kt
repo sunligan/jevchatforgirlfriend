@@ -228,12 +228,18 @@ class Prefs private constructor(private val sp: SharedPreferences, prefsName: St
         get() = sp.getBoolean(K_CS_AUTO_SEND, false)
         set(v) = sp.edit().putBoolean(K_CS_AUTO_SEND, v).apply()
 
+    /**
+     * Deliberately blank: a non-blank default means auto-send has text to fire
+     * at strangers before the operator has configured anything, and
+     * `CustomerReplyLogic`'s "no script configured, get a human" branch becomes
+     * unreachable. The settings field shows the example as its hint instead.
+     */
     var customerReplyFirst: String
-        get() = sp.getString(K_CS_REPLY_FIRST, "您好，请问您需要咨询什么？") ?: ""
+        get() = sp.getString(K_CS_REPLY_FIRST, "") ?: ""
         set(v) = sp.edit().putString(K_CS_REPLY_FIRST, v).apply()
 
     var customerReplySecond: String
-        get() = sp.getString(K_CS_REPLY_SECOND, "如果方便，请留下您的联系方式。") ?: ""
+        get() = sp.getString(K_CS_REPLY_SECOND, "") ?: ""
         set(v) = sp.edit().putString(K_CS_REPLY_SECOND, v).apply()
 
     var customerCategory: String

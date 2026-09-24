@@ -46,23 +46,39 @@ data class CustomerLead(
 
 object CustomerLeadParser {
     private val phone = Regex("(?<!\\d)(?:1[3-9]\\d{9}|0\\d{2,3}[- ]?\\d{7,8})(?!\\d)")
-    private val wechat = Regex("(?i)(?<![a-z0-9_-])[a-z][a-z0-9_-]{5,19}(?![a-z0-9_-])")
-    private val hint = Regex("(?i)(加微信|加微|微信聊|vx|v信|weixin|wx|联系方式|电话|手机号)")
-    private val falsePositives = setOf("weixin", "wechat", "contact", "phone", "hello", "thanks")
+    /** Shape of a WeChat ID: letter first, then 5..19 more of letter/digit/`_`/`-`. */
+    private val idToken = Regex("(?i)(?<![a-z0-9_-])[a-z][a-z0-9_-]{5,19}(?![a-z0-9_-])")
+    /** Bare 微信 covers 加微信 / 微信号 / 微信聊 without listing each. */
+    private val hint = Regex("(?i)(微信|weixin|wechat|vx|v信|wx|联系方式|电话|手机号)")
 
-    fun extract(text: String, category: String, targetGroup: String): CustomerLead? {
+    /**
+     * A Latin token counts as a WeChat ID only when the same message asks for
+     * contact details AND the token is shaped like an ID (carries a digit, `_`
+     * or `-`). Shape alone is not enough: matching any 6..20 letter word turned
+     * plain English ("please", "because") into phantom leads that beeped and
+     * landed in the dispatch queue.
+     */
+    fun wechatId(text: String): String? {
+        if (!hint.containsMatchIn(text)) return null
+        return idToken.findAll(text)
+            .map { it.value }
+            .firstOrNull { token -> token.any { it.isDigit() || it == '_' || it == '-' } }
+    }
+
+    /** Asks for contact details but gives none — a human has to follow up. */
+    fun isWeChatHint(text: String): Boolean =
+        hint.containsMatchIn(text) && phone.find(text) == null && wechatId(text) == null
+
+    fun extract(text: String, title: String, category: String, targetGroup: String): CustomerLead? {
         val raw = text.trim(); if (raw.isBlank()) return null
         val p = phone.find(raw)?.value?.replace("-", "")?.replace(" ", "")
-        val w = wechat.findAll(raw).map { it.value }.firstOrNull { it.lowercase() !in falsePositives }
+        val w = wechatId(raw)
         if (p == null && w == null && !hint.containsMatchIn(raw)) return null
         return CustomerLead(
-            sourceApp = "douyin", sourceTitle = "", category = category.ifBlank { "未分类" },
+            sourceApp = "douyin", sourceTitle = title, category = category.ifBlank { "未分类" },
             phone = p, wechat = w, rawText = raw, targetGroup = targetGroup
         )
     }
-
-    fun isWeChatHint(text: String): Boolean = hint.containsMatchIn(text) &&
-        phone.find(text) == null && wechat.findAll(text).none { it.value.lowercase() !in falsePositives }
 }
 
 class CustomerLeadStore(context: Context) {
@@ -89,6 +105,20 @@ class CustomerLeadStore(context: Context) {
         val all = load(); val i = all.indexOfFirst { it.id == id }
         if (i < 0) return@synchronized false
         write(all.toMutableList().also { it[i] = it[i].copy(dispatched = true) }); true
+    }
+
+    /**
+     * Delete every lead, returning how many there were.
+     *
+     * This is the only file in the app holding *other people's* phone numbers
+     * and WeChat IDs, so it has to be wipeable from the UI. The settings
+     * "清空知识库与历史" button only ever deleted `filesDir/kb`.
+     */
+    fun clear(): Int = synchronized(lock) {
+        val n = load().size
+        if (n == 0 && !file.exists()) return@synchronized 0
+        if (file.exists() && !file.delete()) return@synchronized 0
+        n
     }
 
     private fun load(): List<CustomerLead> {

@@ -50,7 +50,26 @@ class CustomerQueueActivity : AppCompatActivity() {
             root.addView(card().apply { addView(text("还没有线索。抖音客服模式识别到手机号、微信号或相关暗示后会出现在这里。", 13f, sub)) })
             return
         }
+        root.addView(card().apply {
+            addView(text("共 ${leads.size} 条，待分发 ${leads.count { !it.dispatched }} 条。", 12f, sub))
+            addView(button("清空全部线索") { confirmClear(leads.size) })
+        })
         leads.forEach { root.addView(leadCard(it)) }
+    }
+
+    /** These are other people's phone numbers and WeChat IDs; the app has to
+     *  offer a way to delete them, not just mark them handled. */
+    private fun confirmClear(count: Int) {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("清空全部线索")
+            .setMessage("将删除 $count 条线索，包括其中记录的手机号和微信号。不可恢复。")
+            .setPositiveButton("清空") { _, _ ->
+                store.clear()
+                render()
+                android.widget.Toast.makeText(this, "已清空全部线索", android.widget.Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun leadCard(lead: CustomerLead): View = card().apply {

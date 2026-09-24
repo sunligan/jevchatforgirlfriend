@@ -310,15 +310,17 @@ class SettingsActivity : AppCompatActivity() {
             startActivity(android.content.Intent(this, KnowledgeActivity::class.java))
         })
         val kbResult = resultText()
-        card2.addView(cardBtn("清空知识库与历史") {
+        card2.addView(cardBtn("清空知识库、历史与客服线索") {
             val c = KbStore.get(this).counts()
+            val leads = com.jev.probe.core.CustomerLeadStore(this).all().size
             androidx.appcompat.app.AlertDialog.Builder(this)
-                .setTitle("清空知识库与历史")
-                .setMessage("将删除 ${c.notes} 条笔记、${c.contacts} 个联系人、${c.logLines} 条聊天历史。" +
-                    "密钥、白名单等设置不受影响。不可恢复。")
+                .setTitle("清空知识库、历史与客服线索")
+                .setMessage("将删除 ${c.notes} 条笔记、${c.contacts} 个联系人、${c.logLines} 条聊天历史、" +
+                    "${leads} 条客服线索（含他人手机号与微信号）。密钥、白名单等设置不受影响。不可恢复。")
                 .setPositiveButton("清空") { _, _ ->
                     KbStore.get(this).clearAll()
-                    kbResult.text = "已清空知识库与历史"
+                    com.jev.probe.core.CustomerLeadStore(this).clear()
+                    kbResult.text = "已清空知识库、历史与客服线索"
                 }
                 .setNegativeButton("取消", null)
                 .show()
@@ -360,6 +362,7 @@ class SettingsActivity : AppCompatActivity() {
             minLines = 2; gravity = android.view.Gravity.TOP
         }
         csCard.addView(csSecondEdit)
+        csCard.addView(text("两句都留空时不会发送任何内容，面板会提示人工处理；自动发送也不会启动。", 11f, sub))
         csCard.addView(label("线索分类（可自定义）"))
         val csCategoryEdit = edit(prefs.customerCategory, "例如：高意向 / 售后 / 代理商")
         csCard.addView(csCategoryEdit)

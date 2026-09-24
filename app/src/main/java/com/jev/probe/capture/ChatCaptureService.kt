@@ -3,6 +3,8 @@ package com.jev.probe.capture
 import android.accessibilityservice.AccessibilityService
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.text.InputType
@@ -20,9 +22,11 @@ import com.jev.probe.core.CapturePolicy
 import com.jev.probe.core.CaptureSource
 import com.jev.probe.core.ChatSnapshot
 import com.jev.probe.core.ConversationGuard
-import com.jev.probe.core.CustomerLeadParser
+import com.jev.probe.core.CustomerConfig
+import com.jev.probe.core.CustomerLead
 import com.jev.probe.core.CustomerLeadStore
-import com.jev.probe.core.CustomerReplyLogic
+import com.jev.probe.core.CustomerSendSchedule
+import com.jev.probe.core.CustomerSessionController
 import com.jev.probe.core.Msg
 import com.jev.probe.core.Prefs
 import com.jev.probe.core.SnapshotChange
@@ -82,6 +86,10 @@ open class ChatCaptureService : AccessibilityService() {
     private val capturePolicy = CapturePolicy()
     private var stopEnabledObserver: (() -> Unit)? = null
     private val customerLeads by lazy { CustomerLeadStore(this) }
+    private val customerSession = CustomerSessionController()
+    /** Created on first use, released in [onDestroy]; a ToneGenerator per lead
+     *  leaks the native audio resource it holds. */
+    private var toneGen: ToneGenerator? = null
     private var lastViewport: String? = null
     private var lastIme: String? = null
     private var captureScheduled = false
@@ -101,6 +109,7 @@ open class ChatCaptureService : AccessibilityService() {
         captureScheduled = false
         main.removeCallbacks(debounce)
         conversationGuard.invalidate()
+        customerSession.reset()   // the next conversation's leads are scanned from scratch
         analysisJob?.cancel(true)
         analysisJob = null
         overlay?.resetForNewConversation()
@@ -391,40 +400,64 @@ open class ChatCaptureService : AccessibilityService() {
         val changed = conversationGuard.observe(observation(pkg, windowId, snapshot))
         currentSnapshot = snapshot; stableSnapshot = snapshot; activePkg = pkg
         if (!changed && !manual) return true
-        val lead = snapshot.messages.lastOrNull { it.side == "other" }?.text?.let {
-            CustomerLeadParser.extract(it, prefs.customerCategory, prefs.customerWechatGroup)
-        }
-        if (lead != null) {
-            val stored = customerLeads.append(lead.copy(sourceTitle = snapshot.title.orEmpty()))
-            if (stored) {
-                android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 90)
-                    .startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 180)
-                overlay?.toast(if (lead.phone != null || lead.wechat != null) "已保存联系方式，待分发到：${lead.targetGroup.ifBlank { "未配置群" }}" else "检测到疑似加微信意图，请人工处理")
-            }
-        }
-        val plan = CustomerReplyLogic.plan(snapshot.messages, prefs.customerReplyFirst, prefs.customerReplySecond)
+
+        val action = customerSession.onSnapshot(snapshot, customerConfig())
+        storeLeads(action.leads, action.notify)
+
         val ticket = conversationGuard.start()
         if (ticket == null) return true
         overlay?.resetForNewConversation()
         overlay?.setSnapshotInfo(snapshot)
         overlay?.showCustomerPlan(
-            snapshot.title.orEmpty(), plan.lines, plan.reason,
-            prefs.customerAutoSend && !plan.needsHuman,
+            snapshot.title.orEmpty(), action.plan.lines, action.plan.reason, action.autoSend,
             onFill = { text -> fillInput(text, ticket) },
-            onAutoSend = {
-                if (prefs.customerAutoSend && !plan.needsHuman) {
-                    plan.lines.forEachIndexed { index, text ->
-                        main.postDelayed({ fillInput(text, ticket, autoSend = true) }, index * 900L)
-                    }
-                }
-            }
+            onAutoSend = { if (action.autoSend) scheduleAutoSend(action.plan.lines, ticket) }
         )
-        if (allowAutoAnalyze && prefs.customerAutoSend && !plan.needsHuman && plan.lines.isNotEmpty()) {
-            plan.lines.forEachIndexed { index, text ->
-                main.postDelayed({ fillInput(text, ticket, autoSend = true) }, index * 900L)
+        if (allowAutoAnalyze && action.autoSend) scheduleAutoSend(action.plan.lines, ticket)
+        return true
+    }
+
+    private fun customerConfig() = CustomerConfig(
+        replyFirst = prefs.customerReplyFirst,
+        replySecond = prefs.customerReplySecond,
+        category = prefs.customerCategory,
+        targetGroup = prefs.customerWechatGroup,
+        autoSend = prefs.customerAutoSend
+    )
+
+    /** One schedule, one place — the "立即执行" button and the automatic path
+     *  used to carry byte-identical copies of this loop. */
+    private fun scheduleAutoSend(lines: List<String>, ticket: ConversationGuard.Ticket) {
+        CustomerSendSchedule.delays(lines.size).forEachIndexed { index, delay ->
+            main.postDelayed({ fillInput(lines[index], ticket, autoSend = true) }, delay)
+        }
+    }
+
+    /**
+     * Leads hold other people's phone numbers and WeChat IDs, so the JSON
+     * read/write behind [CustomerLeadStore.append] must never run here: this
+     * method is reached from the main-thread capture debounce, and an
+     * accessibility service that blocks the main thread gets disconnected by
+     * the system. The store's own 24 h same-text dedupe is what makes a re-scan
+     * of an unchanged screen harmless.
+     */
+    private fun storeLeads(leads: List<CustomerLead>, notify: String?) {
+        if (leads.isEmpty()) return
+        submit {
+            val saved = leads.count { customerLeads.append(it) }
+            if (saved > 0) main.post {
+                beep()
+                overlay?.toast(notify ?: "已保存 $saved 条线索")
             }
         }
-        return true
+    }
+
+    private fun beep() {
+        if (!connected) return   // a worker callback landing after teardown must not re-create it
+        val tone = toneGen ?: runCatching {
+            ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90)
+        }.getOrNull()?.also { toneGen = it } ?: return
+        runCatching { tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 180) }
     }
 
     private fun acceptSnapshot(
@@ -821,6 +854,8 @@ open class ChatCaptureService : AccessibilityService() {
         overlay?.onToggleEnabled = null
         overlay?.hide()
         overlay = null
+        runCatching { toneGen?.release() }
+        toneGen = null
         worker.shutdownNow()
     }
 
